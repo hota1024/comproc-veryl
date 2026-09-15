@@ -1,27 +1,74 @@
-/// ComProc CPU ボード Rev4 (Tang Nano 9K) 用トップモジュール。
+/// ComProc CPU ボード Rev4 (Tang Nano 9K) の周辺機器を全部使うデモ。
 ///
-/// ポート名は comproc リポジトリの
-/// src/cpu/board/rev4_tangnano9k/src/port.cst に合わせてある。
-/// ただし lcd_db だけは Veryl が [3:0] のビット範囲しか生成しないため、
-/// 本プロジェクトの port.cst では lcd_db[3] を DB7 として割り当てている。
+/// SW1 の下位 2 ビットで 4 つのモードを切り替える。
+///
+/// | SW1-1,2 | モード | 内容 |
+/// | --- | --- | --- |
+/// | 00 | LIFE  | ライフゲーム（8x8 トーラス） |
+/// | 01 | ANIM  | アニメーション 4 種 |
+/// | 10 | SNAKE | スネーク（UART の wasd / ボタンで右折） |
+/// | 11 | ADC   | 自作 ADC のレベルメーター |
+///
+/// | SW1 | 役割 |
+/// | --- | --- |
+/// | 1,2 | モード |
+/// | 3,4,5 | 速度 (0=遅い .. 7=速い) |
+/// | 6,7 | LIFE の初期パターン / ANIM のパターン番号 |
+/// | 8 | 一時停止 |
+///
+/// UART は 115200bps 8N1。受け付けるコマンドは
+/// r(やり直し) / スペース(一時停止) / n(1 コマ進める) /
+/// wasd(方向・カーソル) / t(セル反転) / g(グライダー) / c(全消去) / p(状態表示)。
+/// 500ms ごとに LCD と同じ内容を 1 行にして送り返す。
 module Main (
     /// 27 MHz 発振器 (pin 52)。
     sys_clk: input logic,
-    /// リセットボタン (pin 4)。押すと Low。
-    rst_n_raw: input  logic,
-    lcd_e    : output logic,
-    lcd_rw   : output logic,
-    lcd_rs   : output logic,
+    /// オンボードボタン S2 (pin 4)。押すと Low。リセット。
+    rst_n_raw: input logic,
+    /// オンボードボタン S1 (pin 3)。押すと Low。ユーザーボタン。
+    btn_n_raw: input logic,
+    /// ROW1..ROW8, 7SEG。アクティブ Low。
+    led_row: output logic<9>,
+    /// D0..D7。アクティブ High。
+    led_col: output logic<8>,
+    lcd_e  : output logic   ,
+    lcd_rw : output logic   ,
+    lcd_rs : output logic   ,
     /// lcd_db[3]=DB7, [2]=DB6, [1]=DB5, [0]=DB4。
     lcd_db: output logic<4>,
-    /// Tang Nano 9K のオンボード LED (負論理)。動作確認用。
+    /// SW1 の 8 連 DIP スイッチ (pin 79..86)。ON で Low。
+    sw_n_raw: input logic<8>,
+    /// ComProc CPU ボード側の USB シリアル (FT234X)。
+    uart_rx: input  logic,
+    uart_tx: output logic,
+    /// Tang Nano 9K 本体の USB シリアル (BL702)。
+    /// 書き込みに使うケーブル 1 本で UART も使えるようにしてある。
+    uart_rx2   : input  logic,
+    uart_tx2   : output logic,
+    adc_cmp    : input  logic,
+    adc_sh_ctl : output logic,
+    adc_dac_pwm: output logic,
+    /// GPIO ヘッダ 8 本 (pin 68..75)。表示中の列データをそのまま出す。
+    gpio: output logic<8>,
+    /// Tang Nano 9K のオンボード LED (負論理)。
     onboard_led: output logic<6>,
 ) {
-    const CLK_FREQ_HZ: u32 = 27_000_000;
+    const CLK_FREQ_HZ: u32 = BoardPkg::CLK_FREQ_HZ;
+
+    const MODE_LIFE : logic<2> = 0;
+    const MODE_ANIM : logic<2> = 1;
+    const MODE_SNAKE: logic<2> = 2;
+
+    // LCD の 1 行 16 文字ぶんのひな形。下位バイトが左端の文字。
+    const L1_LIFE  : logic<128> = 128'h30303d5020303030303d47204546494c; // "LIFE G=0000 P=00"
+    const L1_ANIM  : logic<128> = 128'h202020202020303d544150204d494e41; // "ANIM PAT=0      "
+    const L1_SNAKE : logic<128> = 128'h204e55522030303d435320454b414e53; // "SNAKE SC=00 RUN "
+    const L1_ADC   : logic<128> = 128'h2020303d4c4556454c2030303d434441; // "ADC=00 LEVEL=0  "
+    const L2_COMMON: logic<128> = 128'h2030303d5753204e555220303d445053; // "SPD=0 RUN SW=00 "
 
     let clk: '_ clock = sys_clk;
 
-    // リセットボタンを 2 段のフリップフロップで同期化して同期リセットとして使う。
+    // リセットボタンを 2 段のフリップフロップで同期化する。
     // FPGA コンフィグ直後は rst_n_ff が 0 から始まるため、
     // ボタンを押さなくても電源投入時にリセットがかかる。
     var rst_n_ff: logic<2>;
@@ -30,20 +77,527 @@ module Main (
     }
     let rst_n: '_ reset_sync_low = rst_n_ff[1];
 
-    var done: logic;
+    // ================ 入力 ================
+    var sw      : logic<8>;
+    var btn     : logic   ;
+    var btn_push: logic   ;
 
-    // 表示が終わったらオンボード LED を 1 個点灯する（負論理）。
-    assign onboard_led = if done ? 6'b111110 : 6'b111111;
-
-    inst hello: LcdHello #(
-        CLK_FREQ_HZ: CLK_FREQ_HZ,
+    inst u_sw: SwInput #(
+        WIDTH: 8,
     ) (
-        i_clk   : clk   ,
-        i_rst   : rst_n ,
-        o_lcd_e : lcd_e ,
-        o_lcd_rw: lcd_rw,
-        o_lcd_rs: lcd_rs,
-        o_lcd_db: lcd_db,
-        o_done  : done  ,
+        i_clk    : clk     ,
+        i_rst    : rst_n   ,
+        i_raw    : sw_n_raw,
+        o_level  : sw      ,
+        o_pressed: _       ,
     );
+
+    inst u_btn: SwInput #(
+        WIDTH: 1,
+    ) (
+        i_clk    : clk      ,
+        i_rst    : rst_n    ,
+        i_raw    : btn_n_raw,
+        o_level  : btn      ,
+        o_pressed: btn_push ,
+    );
+
+    let mode  : logic<2> = sw[1:0];
+    let speed : logic<3> = sw[4:2];
+    let pat_sw: logic<2> = sw[6:5];
+
+    // ================ UART ================
+    var rx_valid: logic   ;
+    var rx_data : logic<8>;
+    var tx_valid: logic   ;
+    var tx_data : logic<8>;
+    var tx_ready: logic   ;
+
+    // どちらのケーブルからでも受け取れるようにする。
+    // 使っていない側はプルアップで High のままなので、
+    // 論理積を取れば「どちらかが Low なら Low」になる。
+    let uart_rx_any: logic = uart_rx && uart_rx2;
+
+    inst u_uart_rx: UartRx (
+        i_clk  : clk        ,
+        i_rst  : rst_n      ,
+        i_rx   : uart_rx_any,
+        o_valid: rx_valid   ,
+        o_data : rx_data    ,
+    );
+
+    inst u_uart_tx: UartTx (
+        i_clk  : clk     ,
+        i_rst  : rst_n   ,
+        i_valid: tx_valid,
+        i_data : tx_data ,
+        o_ready: tx_ready,
+        o_tx   : uart_tx ,
+    );
+    // 送信は両方の口に同じものを出す。
+    assign uart_tx2 = uart_tx;
+
+    /// 受け取った文字を小文字に寄せる。
+    let rx_ch: logic<8> = if (rx_data >= 8'h41) && (rx_data <= 8'h5a) ? rx_data + 8'h20 : rx_data;
+
+    let cmd_restart: logic = rx_valid && (rx_ch == 8'h72); // 'r'
+    let cmd_pause  : logic = rx_valid && (rx_ch == 8'h20); // スペース
+    let cmd_step   : logic = rx_valid && (rx_ch == 8'h6e); // 'n'
+    let cmd_up     : logic = rx_valid && (rx_ch == 8'h77); // 'w'
+    let cmd_left   : logic = rx_valid && (rx_ch == 8'h61); // 'a'
+    let cmd_down   : logic = rx_valid && (rx_ch == 8'h73); // 's'
+    let cmd_right  : logic = rx_valid && (rx_ch == 8'h64); // 'd'
+    let cmd_toggle : logic = rx_valid && (rx_ch == 8'h74); // 't'
+    let cmd_glider : logic = rx_valid && (rx_ch == 8'h67); // 'g'
+    let cmd_clear  : logic = rx_valid && (rx_ch == 8'h63); // 'c'
+    let cmd_print  : logic = rx_valid && (rx_ch == 8'h70); // 'p'
+
+    let cmd_dir    : logic    = cmd_up || cmd_left || cmd_down || cmd_right;
+    let cmd_dir_val: logic<2> = if cmd_up ? 0 : if cmd_right ? 1 : if cmd_down ? 2 : 3;
+
+    // ================ ADC と乱数 ================
+    var adc_value: logic<8>;
+    var adc_done : logic   ;
+
+    inst u_adc: Adc (
+        i_clk    : clk        ,
+        i_rst    : rst_n      ,
+        i_cmp    : adc_cmp    ,
+        o_sh_ctl : adc_sh_ctl ,
+        o_dac_pwm: adc_dac_pwm,
+        o_result : adc_value  ,
+        o_done   : adc_done   ,
+    );
+
+    // ADC の変換結果を種に混ぜて、電源投入ごとに違う系列にする。
+    var rnd_a: logic<32>;
+    var rnd_b: logic<32>;
+
+    inst u_rng_a: Lfsr (
+        i_clk    : clk                     ,
+        i_rst    : rst_n                   ,
+        i_en     : 1'b1                    ,
+        i_seed_en: adc_done                ,
+        i_seed   : {rnd_a[23:0], adc_value},
+        o_value  : rnd_a                   ,
+    );
+
+    inst u_rng_b: Lfsr (
+        i_clk    : clk  ,
+        i_rst    : rst_n,
+        i_en     : 1'b1 ,
+        i_seed_en: 1'b0 ,
+        i_seed   : 32'd0,
+        o_value  : rnd_b,
+    );
+
+    // ================ 時間の刻み ================
+    /// 速度 0 で 1 秒、速度 7 で約 8ms。
+    const TICK_W     : u32           = 25;
+    let   tick_period: logic<TICK_W> = (CLK_FREQ_HZ as TICK_W) >> speed;
+
+    /// 約 4Hz の点滅。カーソルや餌に使う。
+    const BLINK_CYC: u32 = CLK_FREQ_HZ / 8;
+    const BLINK_W  : u32 = $clog2(BLINK_CYC);
+
+    var tick_cnt  : logic<TICK_W> ;
+    var tick      : logic         ;
+    var blink_cnt : logic<BLINK_W>;
+    var blink     : logic         ;
+    var report_cnt: logic<TICK_W> ;
+    var report_req: logic         ;
+    var pause_uart: logic         ;
+
+    let pause: logic = sw[7] || pause_uart;
+    /// エンジンを 1 コマ進める合図。
+    let engine_tick: logic = (tick && !pause) || cmd_step;
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            tick_cnt   = 0;
+            tick       = 0;
+            blink_cnt  = 0;
+            blink      = 0;
+            report_cnt = 0;
+            report_req = 0;
+            pause_uart = 0;
+        } else {
+            tick       = 0;
+            report_req = 0;
+
+            if tick_cnt >= tick_period - 1 {
+                tick_cnt = 0;
+                tick     = 1;
+            } else {
+                tick_cnt = tick_cnt + 1;
+            }
+
+            if blink_cnt >= (BLINK_CYC - 1) as BLINK_W {
+                blink_cnt = 0;
+                blink     = ~blink;
+            } else {
+                blink_cnt = blink_cnt + 1;
+            }
+
+            if report_cnt >= (CLK_FREQ_HZ / 2 - 1) as TICK_W {
+                report_cnt = 0;
+                report_req = 1;
+            } else {
+                report_cnt = report_cnt + 1;
+            }
+
+            if cmd_pause {
+                pause_uart = ~pause_uart;
+            }
+        }
+    }
+
+    // モードが変わった瞬間を捕まえる。
+    var mode_d: logic<2>;
+    always_ff (clk, rst_n) {
+        if_reset {
+            mode_d = 0;
+        } else {
+            mode_d = mode;
+        }
+    }
+    let mode_changed: logic = mode != mode_d;
+
+    // ================ LIFE ================
+    /// 盤面の初期値。SW1-6,7 で選ぶ。
+    var life_seed: logic<8> [8];
+    always_comb {
+        for y in 0..8 {
+            life_seed[y] = 0;
+        }
+        if pat_sw == 0 {
+            // ランダム。2 本の LFSR から 64 ビットぶん取る。
+            for y in 0..4 {
+                life_seed[y] = rnd_a[y step 8];
+            }
+            for y in 0..4 {
+                life_seed[y + 4] = rnd_b[y step 8];
+            }
+        } else if pat_sw == 1 {
+            // グライダー
+            life_seed[1] = 8'b0000_0100;
+            life_seed[2] = 8'b0000_1000;
+            life_seed[3] = 8'b0000_1110;
+        } else if pat_sw == 2 {
+            // R ペントミノ
+            life_seed[3] = 8'b0011_0000;
+            life_seed[4] = 8'b0001_1000;
+            life_seed[5] = 8'b0001_0000;
+        }
+        // pat_sw == 3 は全消去のまま（UART で描く用）
+    }
+
+    /// 実際に読み込ませる盤面。UART の g / c はひな形を上書きする。
+    var life_load_grid: logic<8> [8];
+    always_comb {
+        for y in 0..8 {
+            life_load_grid[y] = 0;
+        }
+        if cmd_glider {
+            life_load_grid[1] = 8'b0000_0100;
+            life_load_grid[2] = 8'b0000_1000;
+            life_load_grid[3] = 8'b0000_1110;
+        } else if !cmd_clear {
+            for y in 0..8 {
+                life_load_grid[y] = life_seed[y];
+            }
+        }
+    }
+
+    var life_grid    : logic<8>  [8];
+    var life_pop     : logic<7>     ;
+    var life_gen     : logic<16>    ;
+    var life_stagnant: logic        ;
+    /// 盤面が動かなくなったら数える。
+    var stagnant_cnt: logic<4>;
+    /// LIFE のカーソル。一時停止中に wasd で動かして t で反転できる。
+    var cur_y: logic<3>;
+    var cur_x: logic<3>;
+
+    let life_active: logic = mode == MODE_LIFE;
+    let life_reload: logic = life_active
+        && (mode_changed || btn_push || cmd_restart || cmd_glider || cmd_clear || (stagnant_cnt >= 8));
+
+    inst u_life: LifeEngine (
+        i_clk      : clk                       ,
+        i_rst      : rst_n                     ,
+        i_step     : engine_tick && life_active,
+        i_load     : life_reload               ,
+        i_load_grid: life_load_grid            ,
+        i_toggle   : cmd_toggle && life_active,
+        i_ty       : cur_y                     ,
+        i_tx       : cur_x                     ,
+        o_grid     : life_grid                 ,
+        o_pop      : life_pop                  ,
+        o_gen      : life_gen                  ,
+        o_stagnant : life_stagnant             ,
+    );
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            stagnant_cnt = 0;
+            cur_y        = 0;
+            cur_x        = 0;
+        } else {
+            if life_reload {
+                stagnant_cnt = 0;
+            } else if engine_tick && life_active {
+                if life_stagnant || (life_pop == 0) {
+                    if stagnant_cnt <= 14 {
+                        stagnant_cnt = stagnant_cnt + 1;
+                    }
+                } else {
+                    stagnant_cnt = 0;
+                }
+            }
+
+            // カーソル移動は LIFE のときだけ。
+            if life_active && cmd_dir {
+                if cmd_up {
+                    cur_y = cur_y - 1;
+                } else if cmd_down {
+                    cur_y = cur_y + 1;
+                } else if cmd_left {
+                    cur_x = cur_x - 1;
+                } else {
+                    cur_x = cur_x + 1;
+                }
+            }
+        }
+    }
+
+    // ================ ANIM ================
+    var anim_grid: logic<8> [8];
+    var anim_pat : logic<2>    ;
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            anim_pat = 0;
+        } else if mode_changed {
+            anim_pat = pat_sw;
+        } else if (mode == MODE_ANIM) && btn_push {
+            anim_pat = anim_pat + 1;
+        }
+    }
+
+    inst u_anim: AnimEngine (
+        i_clk    : clk                               ,
+        i_rst    : rst_n                             ,
+        i_tick   : engine_tick && (mode == MODE_ANIM),
+        i_pattern: anim_pat                          ,
+        o_grid   : anim_grid                         ,
+    );
+
+    // ================ SNAKE ================
+    var snake_grid : logic<8> [8];
+    var snake_food : logic<6>    ;
+    var snake_score: logic<7>    ;
+    var snake_alive: logic       ;
+    var snake_dir  : logic<2>    ;
+
+    let snake_active: logic = mode == MODE_SNAKE;
+    /// ボタンは「右に曲がる」。死んでいたらやり直し。
+    let snake_turn   : logic = snake_active && btn_push && snake_alive;
+    let snake_restart: logic = snake_active && (mode_changed || cmd_restart || (btn_push && !snake_alive));
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            snake_dir = 1;
+        } else if snake_restart {
+            snake_dir = 1;
+        } else if snake_active && cmd_dir {
+            snake_dir = cmd_dir_val;
+        } else if snake_turn {
+            snake_dir = snake_dir + 1;
+        }
+    }
+
+    inst u_snake: SnakeEngine (
+        i_clk      : clk                                    ,
+        i_rst      : rst_n                                  ,
+        i_tick     : engine_tick && snake_active,
+        i_dir_valid: snake_active && (cmd_dir || snake_turn),
+        i_dir      : snake_dir                              ,
+        i_restart  : snake_restart                          ,
+        i_rand     : rnd_a[5:0]                             ,
+        o_grid     : snake_grid                             ,
+        o_food     : snake_food                             ,
+        o_score    : snake_score                            ,
+        o_alive    : snake_alive                            ,
+    );
+
+    // ================ 表示するフレームを選ぶ ================
+    let adc_level: logic<3> = adc_value[7:5];
+    /// レベルメーターの棒の上端。
+    let bar_top: logic<4> = 7 - (adc_level as 4);
+
+    var frame: logic<8> [8];
+    always_comb {
+        for y in 0..8 {
+            frame[y] = 0;
+        }
+        if life_active {
+            for y in 0..8 {
+                frame[y] = life_grid[y];
+            }
+            // 一時停止中はカーソルを点滅させる。
+            if pause && blink {
+                frame[cur_y][cur_x] = ~life_grid[cur_y][cur_x];
+            }
+        } else if mode == MODE_ANIM {
+            for y in 0..8 {
+                frame[y] = anim_grid[y];
+            }
+        } else if snake_active {
+            for y in 0..8 {
+                frame[y] = snake_grid[y];
+            }
+            // 餌は点滅させて体と区別する。
+            if blink {
+                frame[snake_food[5:3]][snake_food[2:0]] = 1;
+            }
+            // 終わったら盤面全体を点滅させる。
+            if !snake_alive && blink {
+                for y in 0..8 {
+                    frame[y] = 8'hff;
+                }
+            }
+        } else {
+            // ADC レベルメーター。一番上の行に生の値、下 7 行が棒グラフ。
+            frame[0] = adc_value;
+            for y in 1..8 {
+                frame[y] = if (y as 4) >= bar_top ? 8'hff : 8'h00;
+            }
+        }
+    }
+
+    /// 7 セグに出す数字。
+    let seg_digit: logic<4> = case mode {
+        MODE_LIFE : life_gen[3:0],
+        MODE_ANIM : anim_pat as 4,
+        MODE_SNAKE: snake_score[3:0],
+        default   : adc_value[7:4],
+    };
+
+    inst u_matrix: LedMatrix (
+        i_clk    : clk                                                              ,
+        i_rst    : rst_n                                                            ,
+        i_frame  : frame                                                            ,
+        i_seg    : if pause ? BoardPkg::SEG7_DASH : BoardPkg::seg7(seg_digit, blink),
+        o_led_row: led_row                                                          ,
+        o_led_col: led_col                                                          ,
+    );
+
+    // ================ LCD と UART に出すテキスト ================
+    let pop_bcd  : logic<8> = BoardPkg::bcd2(life_pop);
+    let score_bcd: logic<8> = BoardPkg::bcd2(snake_score);
+
+    var text: logic<8> [32];
+    always_comb {
+        // 1 行目はモードごと。
+        for i in 0..16 {
+            text[i] = case mode {
+                MODE_LIFE : L1_LIFE[i step 8],
+                MODE_ANIM : L1_ANIM[i step 8],
+                MODE_SNAKE: L1_SNAKE[i step 8],
+                default   : L1_ADC[i step 8],
+            };
+        }
+        if life_active {
+            text[7]  = BoardPkg::dec_ascii(life_gen[15:12]);
+            text[8]  = BoardPkg::dec_ascii(life_gen[11:8]);
+            text[9]  = BoardPkg::dec_ascii(life_gen[7:4]);
+            text[10] = BoardPkg::dec_ascii(life_gen[3:0]);
+            text[14] = BoardPkg::dec_ascii(pop_bcd[7:4]);
+            text[15] = BoardPkg::dec_ascii(pop_bcd[3:0]);
+        } else if mode == MODE_ANIM {
+            text[9] = BoardPkg::dec_ascii(anim_pat as 4);
+        } else if snake_active {
+            text[9]  = BoardPkg::dec_ascii(score_bcd[7:4]);
+            text[10] = BoardPkg::dec_ascii(score_bcd[3:0]);
+            if !snake_alive {
+                text[12] = 8'h44; // 'D'
+                text[13] = 8'h45; // 'E'
+                text[14] = 8'h44; // 'D'
+            }
+        } else {
+            text[4]  = BoardPkg::hex_ascii(adc_value[7:4]);
+            text[5]  = BoardPkg::hex_ascii(adc_value[3:0]);
+            text[13] = BoardPkg::dec_ascii(adc_level as 4);
+        }
+
+        // 2 行目は共通。速度・実行状態・スイッチの値。
+        for i in 0..16 {
+            text[16 + i] = L2_COMMON[i step 8];
+        }
+        text[16 + 4] = BoardPkg::dec_ascii(speed as 4);
+        if pause {
+            text[16 + 6] = 8'h50; // 'P'
+            text[16 + 7] = 8'h41; // 'A'
+            text[16 + 8] = 8'h55; // 'U'
+        }
+        text[16 + 13] = BoardPkg::hex_ascii(sw[7:4]);
+        text[16 + 14] = BoardPkg::hex_ascii(sw[3:0]);
+    }
+
+    var lcd_ready: logic;
+    inst u_lcd: LcdConsole (
+        i_clk   : clk      ,
+        i_rst   : rst_n    ,
+        i_text  : text     ,
+        o_lcd_e : lcd_e    ,
+        o_lcd_rw: lcd_rw   ,
+        o_lcd_rs: lcd_rs   ,
+        o_lcd_db: lcd_db   ,
+        o_ready : lcd_ready,
+    );
+
+    // ================ UART への状態送信 ================
+    /// 送る文字列は「1 行目 + '|' + 2 行目 + CR + LF」の 35 文字。
+    const REPORT_LEN: u32 = 35;
+
+    var tx_idx    : logic<6>;
+    var tx_sending: logic   ;
+
+    let tx_char: logic<8> = case tx_idx {
+        16     : 8'h7c, // '|'
+        33     : 8'h0d, // CR
+        34     : 8'h0a, // LF
+        default: if tx_idx <= 15 ? text[tx_idx as 5] : text[(tx_idx - 1) as 5],
+    };
+
+    assign tx_valid = tx_sending;
+    assign tx_data  = tx_char;
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            tx_idx     = 0;
+            tx_sending = 0;
+        } else if !tx_sending {
+            if report_req || cmd_print {
+                tx_idx     = 0;
+                tx_sending = 1;
+            }
+        } else if tx_ready {
+            if tx_idx >= (REPORT_LEN - 1) as 6 {
+                tx_sending = 0;
+            } else {
+                tx_idx = tx_idx + 1;
+            }
+        }
+    }
+
+    // ================ 残りの端子 ================
+    // GPIO には表示中の列データをそのまま出す（外部 LED バーやロジアナ用）。
+    assign gpio = led_col;
+
+    // オンボード LED（負論理）。
+    // bit0: LCD 初期化完了 / bit1: 一時停止 / bit2: UART 送信中
+    // bit3: ボタン / bit5,4: モード
+    assign onboard_led = ~{mode, btn, tx_sending, pause, lcd_ready};
 }

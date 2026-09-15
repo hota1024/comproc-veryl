@@ -1,0 +1,108 @@
+/// UART の送受信をループバックで検証する。
+/// シミュレーションを短くするため 1MHz / 115200bps（1 ビット 8 クロック）で回す。
+#[test(test_uart)]
+module test_uart {
+    const CLK_FREQ_HZ: u32 = 1_000_000;
+    const BAUD       : u32 = 115_200;
+    /// 1 バイト分（スタート + 8 + ストップ）に必要なクロック数の余裕込み。
+    const BYTE_CYC: u32 = 200;
+
+    inst u_clock: $tb::clock_gen;
+
+    var rst_n_r:    logic         ;
+    let rst_n  : '_ reset_sync_low = rst_n_r;
+
+    var tx_valid: logic   ;
+    var tx_data : logic<8>;
+    var tx_ready: logic   ;
+    var line    : logic   ;
+    var rx_valid: logic   ;
+    var rx_data : logic<8>;
+
+    inst u_tx: UartTx #(
+        CLK_FREQ_HZ: CLK_FREQ_HZ,
+        BAUD       : BAUD       ,
+    ) (
+        i_clk  : u_clock ,
+        i_rst  : rst_n   ,
+        i_valid: tx_valid,
+        i_data : tx_data ,
+        o_ready: tx_ready,
+        o_tx   : line    ,
+    );
+
+    inst u_rx: UartRx #(
+        CLK_FREQ_HZ: CLK_FREQ_HZ,
+        BAUD       : BAUD       ,
+    ) (
+        i_clk  : u_clock ,
+        i_rst  : rst_n   ,
+        i_rx   : line    ,
+        o_valid: rx_valid,
+        o_data : rx_data ,
+    );
+
+    /// 送ったバイトが受信できるか確かめる。
+    var got     : logic   ;
+    var got_data: logic<8>;
+
+    initial {
+        rst_n_r  = 0;
+        tx_valid = 0;
+        tx_data  = 0;
+        u_clock.next(4);
+        rst_n_r = 1;
+        u_clock.next(2);
+
+        // アイドル状態では 1。
+        $assert(line == 1);
+        $assert(tx_ready == 1);
+
+        for i in 0..8 {
+            var send: logic<8>;
+            // 0x00 や 0xff を含む、ビットパターンの偏ったバイトを送る。
+            send = case i {
+                0      : 8'h00,
+                1      : 8'hff,
+                2      : 8'h55,
+                3      : 8'haa,
+                4      : 8'h41, // 'A'
+                5      : 8'h0f,
+                6      : 8'hf0,
+                default: 8'h7e,
+            };
+
+            tx_data  = send;
+            tx_valid = 1;
+            u_clock.next(1);
+            tx_valid = 0;
+            $assert(tx_ready == 0);
+
+            got      = 0;
+            got_data = 0;
+            for _t in 0..BYTE_CYC {
+                if rx_valid {
+                    got      = 1;
+                    got_data = rx_data;
+                    break;
+                }
+                u_clock.next(1);
+            }
+            $assert(got == 1);
+            $assert(got_data == send);
+
+            // 送信が終わるまで待つ。
+            for _t in 0..BYTE_CYC {
+                if tx_ready {
+                    break;
+                }
+                u_clock.next(1);
+            }
+            $assert(tx_ready == 1);
+            $assert(line == 1);
+        }
+
+        $display("uart loopback ok");
+        $finish();
+    }
+}

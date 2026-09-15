@@ -1,0 +1,175 @@
+/// 16 文字 x 2 行のキャラクタ LCD を「常時書き換えるテキスト表示器」として使う。
+///
+/// i_text の 32 バイト（前半 16 バイトが 1 行目、後半 16 バイトが 2 行目）を
+/// 延々と描き直す。呼び出し側は i_text を好きなタイミングで変えるだけでよい。
+/// 1 巡は約 145ms。表示が乱れても次の巡回で自動的に直る。
+module LcdConsole #(
+    param CLK_FREQ_HZ: u32 = BoardPkg::CLK_FREQ_HZ,
+) (
+    i_clk: input clock         ,
+    i_rst: input reset_sync_low,
+    /// 表示するテキスト。i_text[0..15] が 1 行目、i_text[16..31] が 2 行目。
+    i_text : input  logic<8> [32],
+    o_lcd_e: output logic        ,
+    /// 書き込み専用なので常に 0。
+    o_lcd_rw: output logic,
+    o_lcd_rs: output logic,
+    /// LCD の DB7..DB4。o_lcd_db[3] が DB7。
+    o_lcd_db: output logic<4>,
+    /// 初期化が終わったら 1。
+    o_ready: output logic,
+) {
+    /// LCD へ送る 1 操作。
+    struct LcdOp {
+        /// 1: 転送後に長めに待つ。
+        long_wait: logic,
+        /// 1: 上位 4 ビットのみ送る。
+        nibble: logic,
+        /// 0: コマンド / 1: 表示データ。
+        rs  : logic   ,
+        data: logic<8>,
+    }
+
+    function cmd (
+        data: input logic<8>,
+    ) -> LcdOp {
+        return LcdOp'{long_wait: 0, nibble: 0, rs: 0, data: data};
+    }
+    function cmd_long (
+        data: input logic<8>,
+    ) -> LcdOp {
+        return LcdOp'{long_wait: 1, nibble: 0, rs: 0, data: data};
+    }
+    function cmd_nibble (
+        data: input logic<8>,
+    ) -> LcdOp {
+        return LcdOp'{long_wait: 1, nibble: 1, rs: 0, data: data};
+    }
+    function chr (
+        data: input logic<8>,
+    ) -> LcdOp {
+        return LcdOp'{long_wait: 0, nibble: 0, rs: 1, data: data};
+    }
+
+    /// 初期化シーケンスの操作数。
+    const INIT_NUM: u32 = 8;
+    /// 1 巡の操作数。カーソル移動 2 回 + 32 文字。
+    const DRAW_NUM: u32 = 34;
+
+    /// 電源投入から LCD の内部リセットが終わるまでの待ち。
+    const POWER_ON_WAIT: u32 = CLK_FREQ_HZ / 10;
+    const POW_W        : u32 = $clog2(POWER_ON_WAIT + 1);
+
+    enum Phase: logic<2> {
+        /// 電源投入直後の待ち。
+        PowerOn,
+        /// 初期化コマンド列の送出。
+        Init,
+        /// テキストの描画（ここを延々と繰り返す）。
+        Draw,
+    }
+
+    var phase  : Phase       ;
+    var op_idx : logic<6>    ;
+    var pow_cnt: logic<POW_W>;
+    var busy   : logic       ;
+    var ready  : logic       ;
+
+    var wr_ready: logic;
+    let wr_valid: logic = (phase != Phase::PowerOn) && !busy;
+
+    let init_op: LcdOp = case op_idx {
+        // 8 ビットモードのまま Function set を 3 回送る。
+        0      : cmd_nibble(8'h30),
+        1      : cmd_nibble(8'h30),
+        2      : cmd_nibble(8'h30),
+        // 4 ビットモードへ切り替える。
+        3      : cmd_nibble(8'h20),
+        4      : cmd(8'h28), // Function set: 4 ビット / 2 行 / 5x8 ドット
+        5      : cmd(8'h0c), // Display on, カーソル off
+        6      : cmd(8'h06), // Entry mode: アドレス +1
+        default: cmd_long(8'h01), // Clear display
+    };
+
+    let draw_op: LcdOp = case op_idx {
+        0      : cmd(8'h80), // 1 行目の先頭へ
+        17     : cmd(8'hc0), // 2 行目の先頭へ
+        default: chr(i_text[draw_char_index(op_idx)]),
+    };
+
+    /// 描画操作の番号から i_text の添字を求める。
+    /// op 1..16 が 1 行目の 0..15、op 18..33 が 2 行目の 16..31。
+    function draw_char_index (
+        idx: input logic<6>,
+    ) -> logic<5> {
+        return if idx <= 16 ? (idx - 1) as 5 : (idx - 2) as 5;
+    }
+
+    let op: LcdOp = if phase == Phase::Init ? init_op : draw_op;
+
+    assign o_lcd_rw = 0;
+    assign o_ready  = ready;
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            phase   = Phase::PowerOn;
+            op_idx  = 0;
+            pow_cnt = 0;
+            busy    = 0;
+            ready   = 0;
+        } else {
+            case phase {
+                Phase::PowerOn: if pow_cnt >= POWER_ON_WAIT as POW_W {
+                    phase = Phase::Init;
+                } else {
+                    pow_cnt = pow_cnt + 1;
+                }
+                Phase::Init   : if !busy {
+                    // wr_ready と同時に要求を出せていればこの立ち上がりで
+                    // LcdWriter が受け付ける。
+                    if wr_ready {
+                        busy = 1;
+                    }
+                } else if wr_ready {
+                    busy = 0;
+                    if op_idx >= (INIT_NUM - 1) as 6 {
+                        op_idx = 0;
+                        phase  = Phase::Draw;
+                        ready  = 1;
+                    } else {
+                        op_idx = op_idx + 1;
+                    }
+                }
+                Phase::Draw   : if !busy {
+                    if wr_ready {
+                        busy = 1;
+                    }
+                } else if wr_ready {
+                    busy = 0;
+                    if op_idx >= (DRAW_NUM - 1) as 6 {
+                        op_idx = 0;
+                    } else {
+                        op_idx = op_idx + 1;
+                    }
+                }
+                default       : {}
+            }
+        }
+    }
+
+    inst writer: LcdWriter #(
+        CLK_FREQ_HZ: CLK_FREQ_HZ,
+    ) (
+        i_clk                 ,
+        i_rst                 ,
+        i_valid : wr_valid    ,
+        o_ready : wr_ready    ,
+        i_rs    : op.rs       ,
+        i_data  : op.data     ,
+        i_nibble: op.nibble   ,
+        i_long  : op.long_wait,
+        o_lcd_e               ,
+        o_lcd_rs              ,
+        o_lcd_db              ,
+    );
+}

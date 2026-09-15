@@ -1,0 +1,31 @@
+/// 32 ビットの Galois LFSR。常に回り続けるので、好きなタイミングで
+/// 読めば擬似乱数として使える。
+///
+/// ADC の変換結果やボタンを押した瞬間のカウンタ値を i_seed から
+/// 流し込むと、電源投入ごとに違う系列になる。
+module Lfsr (
+    i_clk: input clock         ,
+    i_rst: input reset_sync_low,
+    /// 1 のとき次の値へ進む。
+    i_en: input logic,
+    /// 1 のとき i_seed を取り込む（0 は無視して 1 を入れる）。
+    i_seed_en: input  logic    ,
+    i_seed   : input  logic<32>,
+    o_value  : output logic<32>,
+) {
+    /// x^32 + x^22 + x^2 + x^1 + 1
+    const TAPS: logic<32> = 32'h8020_0003;
+
+    var state: logic<32>;
+    assign o_value = state;
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            state = 32'h1234_5678;
+        } else if i_seed_en {
+            state = if i_seed == 0 ? 32'h1 : i_seed;
+        } else if i_en {
+            state = if state[0] ? (state >> 1) ^ TAPS : state >> 1;
+        }
+    }
+}

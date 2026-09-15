@@ -37,7 +37,9 @@ veryl build
 
 # Veryl が出力する SystemVerilog には yosys が読めない構文
 # （ユーザー定義型を返す function など）が含まれるので sv2v を通す。
-sv2v target/lcd_writer.sv target/lcd_hello.sv target/main.sv >"$BUILD/top.v"
+# 対象は veryl build が出すファイルリスト (comproc.f) から取る。
+# shellcheck disable=SC2046
+sv2v $(cat comproc.f) >"$BUILD/top.v"
 
 yosys -p "read_verilog $BUILD/top.v; synth_gowin -top Main -json $BUILD/top.json"
 

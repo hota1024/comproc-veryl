@@ -1,0 +1,98 @@
+/// ComProc CPU ボード Rev4 (Tang Nano 9K) 共通の定数と小さな関数。
+package BoardPkg {
+    /// sys_clk の周波数[Hz]。
+    const CLK_FREQ_HZ: u32 = 27_000_000;
+
+    /// 8x8 LED マトリクスの 1 フレーム。frame[y][x] が 1 で点灯する。
+    /// y=0 が ROW1、x=0 が COL1。
+    /// ※ Veryl のパッケージでは型別名を使わず、各モジュールで
+    ///    `logic<8> [8]` と書く。ここでは向きの取り決めだけを記す。
+
+    /// 7 セグの点灯パターンを返す。ビット割り当ては本家 comproc の
+    /// main.sv の encode_7seg と同じ。
+    ///
+    /// ```text
+    ///       bit7
+    ///   bit2|~~~|bit6
+    ///       |bit1
+    ///   bit3|___|bit5   . bit0
+    ///       bit4
+    /// ```
+    function seg7 (
+        v  : input logic<4>,
+        dot: input logic   ,
+    ) -> logic<8> {
+        return {
+            case v {
+                4'h0   : 7'b1111110,
+                4'h1   : 7'b0110000,
+                4'h2   : 7'b1101101,
+                4'h3   : 7'b1111001,
+                4'h4   : 7'b0110011,
+                4'h5   : 7'b1011011,
+                4'h6   : 7'b1011111,
+                4'h7   : 7'b1110010,
+                4'h8   : 7'b1111111,
+                4'h9   : 7'b1111011,
+                4'ha   : 7'b1110111,
+                4'hb   : 7'b0011111,
+                4'hc   : 7'b1001110,
+                4'hd   : 7'b0111101,
+                4'he   : 7'b1001111,
+                default: 7'b1000111,
+            }, dot
+        };
+    }
+
+    /// 7 セグに「-」だけを出すパターン。
+    const SEG7_DASH: logic<8> = 8'b0000_0010;
+
+    /// 0..99 を 2 桁の BCD ({十の位, 一の位}) に変換する。
+    function bcd2 (
+        v: input logic<7>,
+    ) -> logic<8> {
+        return switch {
+            v >= 90: {4'd9, (v - 90) as 4},
+            v >= 80: {4'd8, (v - 80) as 4},
+            v >= 70: {4'd7, (v - 70) as 4},
+            v >= 60: {4'd6, (v - 60) as 4},
+            v >= 50: {4'd5, (v - 50) as 4},
+            v >= 40: {4'd4, (v - 40) as 4},
+            v >= 30: {4'd3, (v - 30) as 4},
+            v >= 20: {4'd2, (v - 20) as 4},
+            v >= 10: {4'd1, (v - 10) as 4},
+            default: {4'd0, v as 4},
+        };
+    }
+
+    /// 16 進 1 桁を ASCII に変換する。
+    function hex_ascii (
+        v: input logic<4>,
+    ) -> logic<8> {
+        return if v <= 9 ? 8'h30 + (v as 8) : 8'h41 + ((v - 10) as 8);
+    }
+
+    /// 0..9 を ASCII に変換する。10 以上は '?' を返す。
+    function dec_ascii (
+        v: input logic<4>,
+    ) -> logic<8> {
+        return if v <= 9 ? 8'h30 + (v as 8) : 8'h3f;
+    }
+
+    /// 8 ビットの並びを左右反転する。
+    /// ComProc CPU ボードは COL1 が右端に来るので、
+    /// x=0 を左端として扱うために使う。
+    function rev8 (
+        v: input logic<8>,
+    ) -> logic<8> {
+        return {v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]};
+    }
+
+    /// 8 ビットの立っているビット数を数える。
+    function popcount8 (
+        v: input logic<8>,
+    ) -> logic<4> {
+        return (v[0] as 4) + (v[1] as 4) + (v[2] as 4) + (v[3] as 4) + (v[4] as 4) + (v[5] as 4) + (v[6] as 4)
+            + (v[7] as 4);
+    }
+}

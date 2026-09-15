@@ -1,0 +1,164 @@
+/// 8x8 のスネークゲーム。盤面の端はつながっている（トーラス）ので
+/// 壁に当たって即終了、ということはない。自分の体にぶつかると終わり。
+///
+/// 体は「位置の並び」を円形バッファに持ち、同時に 64 ビットの
+/// 占有マップも持つことで、当たり判定と表示を 1 クロックで行える。
+module SnakeEngine (
+    i_clk: input clock         ,
+    i_rst: input reset_sync_low,
+    /// 1 マス進めるパルス。
+    i_tick: input logic,
+    /// 進行方向の指定。0=上 1=右 2=下 3=左。
+    i_dir_valid: input logic   ,
+    i_dir      : input logic<2>,
+    /// 1 クロックのパルスで最初からやり直す。
+    i_restart: input logic,
+    /// 餌の位置決めに使う乱数。毎クロック変わっていればよい。
+    i_rand: input logic<6>,
+    /// 体の占有状況。
+    o_grid: output logic<8> [8],
+    /// 餌の位置。[5:3] が y、[2:0] が x。
+    o_food: output logic<6>,
+    /// 食べた数。
+    o_score: output logic<7>,
+    /// 生きていれば 1。
+    o_alive: output logic,
+) {
+    const DIR_UP   : logic<2> = 0;
+    const DIR_RIGHT: logic<2> = 1;
+    const DIR_DOWN : logic<2> = 2;
+    // 残りの 3 は左。case の default で受ける。
+
+    /// 体の位置を入れる円形バッファ。
+    var body: logic<6>  [64];
+    var head: logic<6>      ;
+    var tail: logic<6>      ;
+    var occ : logic<64>     ;
+    var dir : logic<2>      ;
+    /// 次の tick で採用する方向。
+    var next_dir: logic<2>;
+    var food    : logic<6>;
+    /// 1 なら餌の位置をまだ決められていない。
+    var food_pending: logic   ;
+    var score       : logic<7>;
+    var alive       : logic   ;
+
+    function pos_of (
+        y: input logic<3>,
+        x: input logic<3>,
+    ) -> logic<6> {
+        return {y, x};
+    }
+
+    /// 指定した方向へ 1 マス進んだ位置。3 ビットなので端はつながる。
+    function move (
+        p: input logic<6>,
+        d: input logic<2>,
+    ) -> logic<6> {
+        var y: logic<3>;
+        var x: logic<3>;
+        y = p[5:3];
+        x = p[2:0];
+        return case d {
+            DIR_UP   : pos_of(y - 1, x),
+            DIR_RIGHT: pos_of(y, x + 1),
+            DIR_DOWN : pos_of(y + 1, x),
+            default  : pos_of(y, x - 1),
+        };
+    }
+
+    /// 180 度の折り返しは受け付けない。
+    function is_reverse (
+        a: input logic<2>,
+        b: input logic<2>,
+    ) -> logic {
+        return a == (b + 2);
+    }
+
+    let new_head: logic<6> = head + 1;
+    let next_pos: logic<6> = move(body[head], next_dir);
+    /// 進んだ先が餌かどうか。
+    let eating: logic = next_pos == food;
+    /// 進んだ先が自分の体かどうか。
+    /// いま尻尾がいるマスは、この tick で空くので当たりにしない
+    /// （餌を食べて伸びるときを除く）。
+    let hit_self: logic = occ[next_pos] && !((next_pos == body[tail]) && !eating);
+
+    assign o_food  = food;
+    assign o_score = score;
+    assign o_alive = alive;
+    always_comb {
+        for y in 0..8 {
+            o_grid[y] = occ[y step 8];
+        }
+    }
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            for i in 0..64 {
+                body[i] = 0;
+            }
+            head         = 0;
+            tail         = 0;
+            occ          = 0;
+            dir          = DIR_RIGHT;
+            next_dir     = DIR_RIGHT;
+            food         = 0;
+            food_pending = 1;
+            score        = 0;
+            alive        = 0;
+        } else if i_restart {
+            // 真ん中に長さ 3 の蛇を置いて右向きに始める。
+            for i in 0..64 {
+                body[i] = 0;
+            }
+            body[0]           = pos_of(3, 1);
+            body[1]           = pos_of(3, 2);
+            body[2]           = pos_of(3, 3);
+            head              = 2;
+            tail              = 0;
+            occ               = 0;
+            occ[pos_of(3, 1)] = 1;
+            occ[pos_of(3, 2)] = 1;
+            occ[pos_of(3, 3)] = 1;
+            dir               = DIR_RIGHT;
+            next_dir          = DIR_RIGHT;
+            food_pending      = 1;
+            score             = 0;
+            alive             = 1;
+        } else {
+            // 餌の位置を決める。占有されていない場所が出るまで毎クロック試す。
+            if food_pending {
+                if !occ[i_rand] {
+                    food         = i_rand;
+                    food_pending = 0;
+                }
+            }
+
+            // 方向の指定を受け付ける。折り返しだけは無視する。
+            if i_dir_valid && !is_reverse(i_dir, dir) {
+                next_dir = i_dir;
+            }
+
+            if i_tick && alive && !food_pending {
+                dir = next_dir;
+                if hit_self {
+                    alive = 0;
+                } else {
+                    // 先に尻尾を空ける。頭が入るマスと同じことがあるので、
+                    // 占有マップは「消してから立てる」順にする。
+                    if eating {
+                        score        = score + 1;
+                        food_pending = 1;
+                    } else {
+                        occ[body[tail]] = 0;
+                        tail            = tail + 1;
+                    }
+                    head           = new_head;
+                    body[new_head] = next_pos;
+                    occ[next_pos]  = 1;
+                }
+            }
+        }
+    }
+}

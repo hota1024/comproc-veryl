@@ -1,0 +1,144 @@
+/// 8x8 のライフゲーム。盤面の上下左右はつながっている（トーラス）。
+///
+/// 次世代の盤面は 64 セルぶんを組み合わせ回路で同時に求めておき、
+/// i_step のパルスで一気に置き換える。
+module LifeEngine (
+    i_clk: input clock         ,
+    i_rst: input reset_sync_low,
+    /// 1 クロックのパルスで 1 世代進む。
+    i_step: input logic,
+    /// 1 クロックのパルスで盤面を i_load_grid に置き換え、世代数を 0 に戻す。
+    i_load     : input logic       ,
+    i_load_grid: input logic<8> [8],
+    /// 1 クロックのパルスで (i_ty, i_tx) のセルを反転する。
+    i_toggle: input  logic       ,
+    i_ty    : input  logic<3>    ,
+    i_tx    : input  logic<3>    ,
+    o_grid  : output logic<8> [8],
+    /// 生きているセルの数 (0..64)。
+    o_pop: output logic<7>,
+    /// 世代数。4 桁の BCD。
+    o_gen: output logic<16>,
+    /// 盤面が固定化した（前世代と同じ、または 2 世代周期）なら 1。
+    o_stagnant: output logic,
+) {
+    var grid: logic<8>  [8];
+    var prev: logic<64>    ;
+    var gene: logic<16>    ;
+
+    // ---- 上下の行（トーラスなので端はつながる）----
+    var up: logic<8> [8];
+    var dn: logic<8> [8];
+    always_comb {
+        up[0] = grid[7];
+        up[1] = grid[0];
+        up[2] = grid[1];
+        up[3] = grid[2];
+        up[4] = grid[3];
+        up[5] = grid[4];
+        up[6] = grid[5];
+        up[7] = grid[6];
+        dn[0] = grid[1];
+        dn[1] = grid[2];
+        dn[2] = grid[3];
+        dn[3] = grid[4];
+        dn[4] = grid[5];
+        dn[5] = grid[6];
+        dn[6] = grid[7];
+        dn[7] = grid[0];
+    }
+
+    // ---- 次の世代 ----
+    // 添字を動かす代わりに行を 1 ビットずつ回した複製を作る。
+    // こうすると x の端の折り返しが連結だけで表現でき、
+    // 合成ツールによって動的添字の扱いが変わる心配がない。
+    //
+    // shl(v)[x] = v[x-1]、shr(v)[x] = v[x+1] になる。
+    var next_grid: logic<8> [8];
+    always_comb {
+        for y in 0..8 {
+            var u  : logic<8>;
+            var c  : logic<8>;
+            var d  : logic<8>;
+            var u_l: logic<8>;
+            var u_r: logic<8>;
+            var c_l: logic<8>;
+            var c_r: logic<8>;
+            var d_l: logic<8>;
+            var d_r: logic<8>;
+
+            u = up[y];
+            c = grid[y];
+            d = dn[y];
+
+            u_l = {u[6:0], u[7]};
+            u_r = {u[0], u[7:1]};
+            c_l = {c[6:0], c[7]};
+            c_r = {c[0], c[7:1]};
+            d_l = {d[6:0], d[7]};
+            d_r = {d[0], d[7:1]};
+
+            for x in 0..8 {
+                var n: logic<4>;
+                // 周囲 8 マスのうち生きている数。
+                n = (u_l[x] as 4) + (u[x] as 4) + (u_r[x] as 4) + (c_l[x] as 4) + (c_r[x] as 4) + (d_l[x] as 4)
+                    + (d[x] as 4) + (d_r[x] as 4);
+                // 生きていれば 2 か 3、死んでいれば 3 のときに次も生きる。
+                next_grid[y][x] = if c[x] ? (n == 2) || (n == 3) : n == 3;
+            }
+        }
+    }
+
+    /// 盤面を 64 ビットに並べたもの。比較用。
+    function flatten (
+        g: input logic<8> [8],
+    ) -> logic<64> {
+        return {g[7], g[6], g[5], g[4], g[3], g[2], g[1], g[0]};
+    }
+
+    let cur_flat : logic<64> = flatten(grid);
+    let next_flat: logic<64> = flatten(next_grid);
+
+    assign o_grid = grid;
+    assign o_gen  = gene;
+    // 次が今と同じ（固定物）か、2 世代前と同じ（振動子）なら「動きが止まった」とみなす。
+    assign o_stagnant = (next_flat == cur_flat) || (next_flat == prev);
+
+    assign o_pop = (BoardPkg::popcount8(grid[0]) as 7) + (BoardPkg::popcount8(grid[1]) as 7)
+        + (BoardPkg::popcount8(grid[2]) as 7) + (BoardPkg::popcount8(grid[3]) as 7)
+        + (BoardPkg::popcount8(grid[4]) as 7) + (BoardPkg::popcount8(grid[5]) as 7)
+        + (BoardPkg::popcount8(grid[6]) as 7) + (BoardPkg::popcount8(grid[7]) as 7);
+
+    /// 4 桁の BCD を 1 増やす。
+    function bcd_inc (
+        v: input logic<16>,
+    ) -> logic<16> {
+        return switch {
+            v[3:0] != 9  : v + 16'd1,
+            v[7:4] != 9  : {v[15:8], v[7:4] + 4'd1, 4'd0},
+            v[11:8] != 9 : {v[15:12], v[11:8] + 4'd1, 8'd0},
+            v[15:12] != 9: {v[15:12] + 4'd1, 12'd0},
+            default      : 16'd0,
+        };
+    }
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            for y in 0..8 {
+                grid[y] = 0;
+            }
+            prev = 0;
+            gene = 0;
+        } else if i_load {
+            grid = i_load_grid;
+            prev = '1;
+            gene = 0;
+        } else if i_toggle {
+            grid[i_ty][i_tx] = ~grid[i_ty][i_tx];
+        } else if i_step {
+            grid = next_grid;
+            prev = cur_flat;
+            gene = bcd_inc(gene);
+        }
+    }
+}

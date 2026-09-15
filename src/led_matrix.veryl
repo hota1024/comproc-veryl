@@ -1,0 +1,74 @@
+/// 8x8 LED マトリクスと 7 セグ LED を時分割で駆動する。
+///
+/// ComProc CPU ボード Rev4 の LED まわりの配線:
+///
+/// ```text
+///   FPGA --[1k]-- G  Q1..Q9 (SSM3J332R, P-ch MOSFET)   ROW1..ROW8 / 7SEG
+///                 S = +3V3, D = 行                      → アクティブ Low
+///
+///   FPGA ---- D0..D7 ┬─ U5 TBD62083APG ─→ COL1..COL8   → アクティブ High
+///                    └─ U4 TBD62083AFG ─→ 7 セグのセグメント
+/// ```
+///
+/// 行は 9 本（マトリクス 8 行 + 7 セグの共通アノード）あり、
+/// 列データ D0..D7 はマトリクスと 7 セグで共有されている。
+/// そのため 9 スロットを順に 1 スロット 1ms で点灯させる
+/// （1 巡 9ms ＝ 約 111Hz）。
+module LedMatrix #(
+    param CLK_FREQ_HZ: u32 = BoardPkg::CLK_FREQ_HZ,
+    /// 1 なら列を左右反転して出す。
+    /// ComProc CPU ボードでは COL1 が右端に来るため、
+    /// i_frame[y][0] を左端として扱いたいときに 1 にする。
+    param MIRROR_X: bit = 1,
+) (
+    i_clk: input clock         ,
+    i_rst: input reset_sync_low,
+    /// 表示するフレーム。i_frame[y][x] が 1 でその画素が点灯する。
+    /// y=0 が ROW1、x=0 が COL1。
+    i_frame: input logic<8> [8],
+    /// 7 セグに出すセグメントパターン。BoardPkg::seg7 で作る。
+    i_seg: input logic<8>,
+    /// ROW1..ROW8, 7SEG。アクティブ Low。
+    o_led_row: output logic<9>,
+    /// D0..D7。アクティブ High。
+    o_led_col: output logic<8>,
+) {
+    /// 1 スロットの長さ。1ms。
+    const SLOT_CYC: u32 = CLK_FREQ_HZ / 1_000;
+    /// 行を選んでから点灯させるまでの間。前の行の残像を防ぐ。
+    const GAP_HEAD: u32 = 200;
+    /// 次の行へ移る前に消灯しておく時間。
+    const GAP_TAIL: u32 = 2_000;
+
+    /// 点灯を終える時刻。
+    const LIT_END: u32 = SLOT_CYC - GAP_TAIL;
+
+    const CNT_W: u32 = $clog2(SLOT_CYC);
+
+    var cnt : logic<CNT_W>;
+    var slot: logic<4>    ;
+
+    /// 点灯期間なら 1。
+    let lit     : logic    = (cnt >= GAP_HEAD as CNT_W) && (cnt <= (LIT_END - 1) as CNT_W);
+    let row_bits: logic<8> = i_frame[slot[2:0]];
+    let row_out : logic<8> = if MIRROR_X ? BoardPkg::rev8(row_bits) : row_bits;
+    assign o_led_col = if !lit ? 8'h00 : if slot == 8 ? i_seg : row_out;
+    // 選んだ行だけ 0 にする。消灯期間は全行 1。
+    assign o_led_row = 9'h1ff ^ (if lit ? 9'b1 << slot : 9'd0);
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            cnt  = 0;
+            slot = 0;
+        } else if cnt >= (SLOT_CYC - 1) as CNT_W {
+            cnt = 0;
+            if slot == 8 {
+                slot = 0;
+            } else {
+                slot = slot + 1;
+            }
+        } else {
+            cnt = cnt + 1;
+        }
+    }
+}

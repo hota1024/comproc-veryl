@@ -1,0 +1,165 @@
+/// スネークエンジンの検証。
+///
+/// A. リスタート直後の姿、1 マス前進、折り返し入力の無視、端の回り込み。
+/// B. 餌を食べて伸びること、伸びた体に突っ込むと終わること。
+#[test(test_snake_engine)]
+module test_snake_engine {
+    inst u_clock: $tb::clock_gen;
+
+    var rst_n_r:    logic         ;
+    let rst_n  : '_ reset_sync_low = rst_n_r;
+
+    var tick     : logic       ;
+    var dir_valid: logic       ;
+    var dir      : logic<2>    ;
+    var restart  : logic       ;
+    var rnd      : logic<6>    ;
+    var grid     : logic<8> [8];
+    var food     : logic<6>    ;
+    var score    : logic<7>    ;
+    var alive    : logic       ;
+
+    const DIR_UP   : logic<2> = 0;
+    const DIR_RIGHT: logic<2> = 1;
+    const DIR_DOWN : logic<2> = 2;
+    const DIR_LEFT : logic<2> = 3;
+
+    inst dut: SnakeEngine (
+        i_clk      : u_clock  ,
+        i_rst      : rst_n    ,
+        i_tick     : tick     ,
+        i_dir_valid: dir_valid,
+        i_dir      : dir      ,
+        i_restart  : restart  ,
+        i_rand     : rnd      ,
+        o_grid     : grid     ,
+        o_food     : food     ,
+        o_score    : score    ,
+        o_alive    : alive    ,
+    );
+
+    /// 盤面に立っているビット数。
+    function live_cells () -> logic<7> {
+        return (BoardPkg::popcount8(grid[0]) as 7) + (BoardPkg::popcount8(grid[1]) as 7)
+            + (BoardPkg::popcount8(grid[2]) as 7) + (BoardPkg::popcount8(grid[3]) as 7)
+            + (BoardPkg::popcount8(grid[4]) as 7) + (BoardPkg::popcount8(grid[5]) as 7)
+            + (BoardPkg::popcount8(grid[6]) as 7) + (BoardPkg::popcount8(grid[7]) as 7);
+    }
+
+    initial {
+        rst_n_r   = 0;
+        tick      = 0;
+        dir_valid = 0;
+        dir       = 0;
+        restart   = 0;
+        rnd       = 6'd63; // 餌は (7,7)。蛇の通り道から遠い。
+        u_clock.next(4);
+        rst_n_r = 1;
+        u_clock.next(2);
+
+        // ================ A ================
+        restart = 1;
+        u_clock.next(1);
+        restart = 0;
+        u_clock.next(4); // 餌の位置が決まるのを待つ
+
+        $assert(alive == 1);
+        $assert(score == 0);
+        $assert(live_cells() == 3);
+        $assert(grid[3] == 8'b0000_1110); // x = 1,2,3
+        $assert(food == 6'd63);
+
+        // 右へ 1 マス。
+        tick = 1;
+        u_clock.next(1);
+        tick = 0;
+        $assert(grid[3] == 8'b0001_1100); // x = 2,3,4
+        $assert(live_cells() == 3);
+
+        // 折り返し（左）は無視されるので、そのまま右へ進む。
+        dir_valid = 1;
+        dir       = DIR_LEFT;
+        u_clock.next(1);
+        dir_valid = 0;
+        tick      = 1;
+        u_clock.next(1);
+        tick = 0;
+        $assert(grid[3] == 8'b0011_1000); // x = 3,4,5
+        $display("reverse rejected ok");
+
+        // さらに 3 回進めると頭が右端を越えて左端へ回り込む。
+        for _i in 0..3 {
+            tick = 1;
+            u_clock.next(1);
+            tick = 0;
+        }
+        // 体は x = 6,7,0
+        $assert(live_cells() == 3);
+        $assert(grid[3] == 8'b1100_0001);
+        $display("torus wrap ok");
+
+        // ================ B ================
+        rnd     = 6'd29; // 餌を (3,5) に置く
+        restart = 1;
+        u_clock.next(1);
+        restart = 0;
+        u_clock.next(4);
+        $assert(food == 6'd29);
+
+        rnd  = 6'd30; // 次の餌は (3,6)
+        tick = 1;
+        u_clock.next(1);
+        tick = 0; // 頭 (3,4)
+        tick = 1;
+        u_clock.next(1);
+        tick = 0; // 頭 (3,5) = 餌
+        u_clock.next(4);
+        $assert(score == 1);
+        $assert(live_cells() == 4);
+        $assert(grid[3] == 8'b0011_1100); // x = 2,3,4,5
+        $assert(food == 6'd30);
+
+        rnd  = 6'd63; // 次の餌は (7,7)
+        tick = 1;
+        u_clock.next(1);
+        tick = 0; // 頭 (3,6) = 餌
+        u_clock.next(4);
+        $assert(score == 2);
+        $assert(live_cells() == 5);
+        $assert(grid[3] == 8'b0111_1100); // x = 2,3,4,5,6
+        $assert(food == 6'd63);
+        $display("eat ok");
+
+        // 長さ 5 で上→左→下と回ると、尻尾ではない体に当たる。
+        dir_valid = 1;
+        dir       = DIR_UP;
+        u_clock.next(1);
+        dir_valid = 0;
+        tick      = 1;
+        u_clock.next(1);
+        tick = 0;
+        $assert(alive == 1);
+
+        dir_valid = 1;
+        dir       = DIR_LEFT;
+        u_clock.next(1);
+        dir_valid = 0;
+        tick      = 1;
+        u_clock.next(1);
+        tick = 0;
+        $assert(alive == 1);
+
+        dir_valid = 1;
+        dir       = DIR_DOWN;
+        u_clock.next(1);
+        dir_valid = 0;
+        tick      = 1;
+        u_clock.next(1);
+        tick = 0;
+        $assert(alive == 0);
+        $display("self collision ok");
+
+        $display("snake engine ok");
+        $finish();
+    }
+}

@@ -1,0 +1,62 @@
+/// 押すと Low になる入力（DIP スイッチ・タクトスイッチ）を
+/// 同期化してチャタリングを取り、正論理にして返す。
+///
+/// 入力が WIDTH ビットぶんまとめて扱えるので、SW1 の 8 ビットと
+/// ボタン 1 ビットのどちらにも使える。
+module SwInput #(
+    param WIDTH      : u32 = 8                    ,
+    param CLK_FREQ_HZ: u32 = BoardPkg::CLK_FREQ_HZ,
+    /// 同じ値が何 ms 続いたら確定とみなすか。
+    param DEBOUNCE_MS: u32 = 5,
+) (
+    i_clk: input clock         ,
+    i_rst: input reset_sync_low,
+    /// 生の入力。押下で Low。
+    i_raw: input logic<WIDTH>,
+    /// 確定した状態。押下で 1（正論理）。
+    o_level: output logic<WIDTH>,
+    /// 立ち上がり（押した瞬間）に 1 クロックだけ 1 になる。
+    o_pressed: output logic<WIDTH>,
+) {
+    const TICK_CYC: u32 = (CLK_FREQ_HZ / 1_000) * DEBOUNCE_MS;
+    const CNT_W   : u32 = $clog2(TICK_CYC);
+
+    // 2 段のフリップフロップで同期化してから反転する。
+    var sync0: logic<WIDTH>;
+    var sync1: logic<WIDTH>;
+    let now  : logic<WIDTH> = ~sync1;
+
+    var cnt  : logic<CNT_W>;
+    var cand : logic<WIDTH>;
+    var level: logic<WIDTH>;
+    var prev : logic<WIDTH>;
+
+    assign o_level   = level;
+    assign o_pressed = level & ~prev;
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            sync0 = '1;
+            sync1 = '1;
+            cnt   = 0;
+            cand  = 0;
+            level = 0;
+            prev  = 0;
+        } else {
+            sync0 = i_raw;
+            sync1 = sync0;
+            prev  = level;
+
+            if now != cand {
+                // 値が変わったので数え直し。
+                cand = now;
+                cnt  = 0;
+            } else if cnt >= (TICK_CYC - 1) as CNT_W {
+                // 同じ値が十分続いたので確定させる。
+                level = cand;
+            } else {
+                cnt = cnt + 1;
+            }
+        }
+    }
+}

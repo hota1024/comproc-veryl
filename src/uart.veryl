@@ -1,0 +1,145 @@
+/// UART 送信機。8 データビット・パリティなし・1 ストップビット。
+module UartTx #(
+    param CLK_FREQ_HZ: u32 = BoardPkg::CLK_FREQ_HZ,
+    param BAUD       : u32 = 115_200              ,
+) (
+    i_clk: input clock         ,
+    i_rst: input reset_sync_low,
+    /// 1 のとき i_data を送信キューに積む。o_ready が 1 のときだけ有効。
+    i_valid: input logic   ,
+    i_data : input logic<8>,
+    /// 1 なら次のバイトを受け付けられる。
+    o_ready: output logic,
+    o_tx   : output logic,
+) {
+    const BIT_CYC: u32 = CLK_FREQ_HZ / BAUD;
+    const CNT_W  : u32 = $clog2(BIT_CYC);
+
+    var cnt  : logic<CNT_W>;
+    var shift: logic<10>   ; // {ストップ, データ 8, スタート}
+    var left : logic<4>    ; // 残りビット数
+
+    assign o_ready = left == 0;
+    assign o_tx    = if left == 0 ? 1'b1 : shift[0];
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            cnt   = 0;
+            shift = '1;
+            left  = 0;
+        } else if left == 0 {
+            if i_valid {
+                shift = {1'b1, i_data, 1'b0};
+                left  = 10;
+                cnt   = 0;
+            }
+        } else if cnt >= (BIT_CYC - 1) as CNT_W {
+            cnt   = 0;
+            shift = {1'b1, shift[9:1]};
+            left  = left - 1;
+        } else {
+            cnt = cnt + 1;
+        }
+    }
+}
+
+/// UART 受信機。8 データビット・パリティなし・1 ストップビット。
+/// 各ビットの中央でサンプリングする。
+module UartRx #(
+    param CLK_FREQ_HZ: u32 = BoardPkg::CLK_FREQ_HZ,
+    param BAUD       : u32 = 115_200              ,
+) (
+    i_clk: input clock         ,
+    i_rst: input reset_sync_low,
+    i_rx : input logic         ,
+    /// 1 バイト受け取ったときに 1 クロックだけ 1 になる。
+    o_valid: output logic   ,
+    o_data : output logic<8>,
+) {
+    const BIT_CYC : u32 = CLK_FREQ_HZ / BAUD;
+    const HALF_CYC: u32 = BIT_CYC / 2;
+    const CNT_W   : u32 = $clog2(BIT_CYC);
+
+    enum State: logic<2> {
+        /// スタートビットの立ち下がりを待つ。
+        Idle,
+        /// スタートビットの中央まで進む。
+        Start,
+        /// データビットを 8 個受け取る。
+        Data,
+        /// ストップビットを確認する。
+        Stop,
+    }
+
+    // 非同期入力を 2 段のフリップフロップで同期化する。
+    var sync : logic<2>    ;
+    var state: State       ;
+    var cnt  : logic<CNT_W>;
+    var idx  : logic<4>    ;
+    var shift: logic<8>    ;
+    var valid: logic       ;
+    var data : logic<8>    ;
+
+    let rx: logic = sync[1];
+
+    assign o_valid = valid;
+    assign o_data  = data;
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            sync  = '1;
+            state = State::Idle;
+            cnt   = 0;
+            idx   = 0;
+            shift = 0;
+            valid = 0;
+            data  = 0;
+        } else {
+            sync  = {sync[0], i_rx};
+            valid = 0;
+
+            case state {
+                State::Idle : if !rx {
+                    // スタートビットを検出した。
+                    cnt   = 0;
+                    state = State::Start;
+                }
+                State::Start: if cnt >= (HALF_CYC - 1) as CNT_W {
+                    cnt = 0;
+                    if !rx {
+                        // 中央でもまだ Low ならスタートビットとして確定。
+                        idx   = 0;
+                        state = State::Data;
+                    } else {
+                        // ノイズだった。
+                        state = State::Idle;
+                    }
+                } else {
+                    cnt = cnt + 1;
+                }
+                State::Data : if cnt >= (BIT_CYC - 1) as CNT_W {
+                    cnt   = 0;
+                    shift = {rx, shift[7:1]};
+                    if idx >= 7 {
+                        state = State::Stop;
+                    } else {
+                        idx = idx + 1;
+                    }
+                } else {
+                    cnt = cnt + 1;
+                }
+                State::Stop : if cnt >= (BIT_CYC - 1) as CNT_W {
+                    cnt = 0;
+                    // ストップビットが High なら受信成功。
+                    if rx {
+                        data  = shift;
+                        valid = 1;
+                    }
+                    state = State::Idle;
+                } else {
+                    cnt = cnt + 1;
+                }
+            }
+        }
+    }
+}

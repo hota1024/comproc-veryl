@@ -1,0 +1,166 @@
+/// LifeGame エンジンの検証。
+///
+/// 1. 3x3 の近傍 512 通りを全数検査して規則が正しいことを確かめる。
+/// 2. ブリンカー（周期 2 の振動子）が正しく振動することを確かめる。
+/// 3. グライダーが 4 世代で斜めに 1 マス進むことを確かめる。
+#[test(test_life_engine)]
+module test_life_engine {
+    inst u_clock: $tb::clock_gen;
+
+    var rst_n_r:    logic         ;
+    let rst_n  : '_ reset_sync_low = rst_n_r;
+
+    var do_step  : logic        ;
+    var load     : logic        ;
+    var load_grid: logic<8>  [8];
+    var toggle   : logic        ;
+    var ty       : logic<3>     ;
+    var tx       : logic<3>     ;
+    var grid     : logic<8>  [8];
+    var pop      : logic<7>     ;
+    var gene     : logic<16>    ;
+    var stagnant : logic        ;
+
+    inst dut: LifeEngine (
+        i_clk      : u_clock  ,
+        i_rst      : rst_n    ,
+        i_step     : do_step  ,
+        i_load     : load     ,
+        i_load_grid: load_grid,
+        i_toggle   : toggle   ,
+        i_ty       : ty       ,
+        i_tx       : tx       ,
+        o_grid     : grid     ,
+        o_pop      : pop      ,
+        o_gen      : gene     ,
+        o_stagnant : stagnant ,
+    );
+
+    initial {
+        rst_n_r = 0;
+        do_step = 0;
+        load    = 0;
+        toggle  = 0;
+        ty      = 0;
+        tx      = 0;
+        for y in 0..8 {
+            load_grid[y] = 0;
+        }
+        u_clock.next(4);
+        rst_n_r = 1;
+        u_clock.next(2);
+
+        // ---- 1. 近傍 512 通りの全数検査 ----
+        // 盤面の中央 (4,4) の周りに 3x3 を置いて 1 世代進め、
+        // (4,4) が規則どおりになっているか確かめる。
+        for p in 0..512 {
+            var nb   : logic<8>;
+            var c    : logic   ;
+            var cnt  : logic<4>;
+            var exp_c: logic   ;
+            nb    = p as 8;
+            c     = (p >> 8) as 1;
+
+            for y in 0..8 {
+                load_grid[y] = 0;
+            }
+            // 上の行: (3,3) (3,4) (3,5)
+            load_grid[3][3] = nb[0];
+            load_grid[3][4] = nb[1];
+            load_grid[3][5] = nb[2];
+            // 同じ行: (4,3) (4,5)
+            load_grid[4][3] = nb[3];
+            load_grid[4][5] = nb[4];
+            // 下の行: (5,3) (5,4) (5,5)
+            load_grid[5][3] = nb[5];
+            load_grid[5][4] = nb[6];
+            load_grid[5][5] = nb[7];
+            load_grid[4][4] = c;
+
+            load = 1;
+            u_clock.next(1);
+            load = 0;
+
+            do_step = 1;
+            u_clock.next(1);
+            do_step = 0;
+
+            cnt   = BoardPkg::popcount8(nb);
+            exp_c = if c ? (cnt == 2) || (cnt == 3) : cnt == 3;
+            $assert(grid[4][4] == exp_c);
+        }
+        $display("rule check: 512 patterns ok");
+
+        // ---- 2. ブリンカー ----
+        // 横 3 連 → 縦 3 連 → 横 3 連 と振動する。
+        for y in 0..8 {
+            load_grid[y] = 0;
+        }
+        load_grid[4][3] = 1;
+        load_grid[4][4] = 1;
+        load_grid[4][5] = 1;
+        load            = 1;
+        u_clock.next(1);
+        load = 0;
+
+        do_step = 1;
+        u_clock.next(1);
+        do_step = 0;
+        // 縦 3 連になっているはず。
+        $assert(grid[3][4] == 1);
+        $assert(grid[4][4] == 1);
+        $assert(grid[5][4] == 1);
+        $assert(pop == 3);
+        $assert(stagnant == 1); // 次の世代で元に戻る＝周期 2
+
+        do_step = 1;
+        u_clock.next(1);
+        do_step = 0;
+        // 横 3 連に戻っているはず。
+        $assert(grid[4][3] == 1);
+        $assert(grid[4][4] == 1);
+        $assert(grid[4][5] == 1);
+        $assert(gene == 16'h0002);
+        $display("blinker ok");
+
+        // ---- 3. グライダー ----
+        // 4 世代で (+1, +1) 平行移動する。
+        for y in 0..8 {
+            load_grid[y] = 0;
+        }
+        load_grid[1][2] = 1;
+        load_grid[2][3] = 1;
+        load_grid[3][1] = 1;
+        load_grid[3][2] = 1;
+        load_grid[3][3] = 1;
+        load            = 1;
+        u_clock.next(1);
+        load = 0;
+
+        for _i in 0..4 {
+            do_step = 1;
+            u_clock.next(1);
+            do_step = 0;
+        }
+
+        $assert(pop == 5);
+        $assert(grid[2][3] == 1);
+        $assert(grid[3][4] == 1);
+        $assert(grid[4][2] == 1);
+        $assert(grid[4][3] == 1);
+        $assert(grid[4][4] == 1);
+        $display("glider ok");
+
+        // ---- 4. セルの反転 ----
+        ty     = 0;
+        tx     = 0;
+        toggle = 1;
+        u_clock.next(1);
+        toggle = 0;
+        $assert(grid[0][0] == 1);
+        $assert(pop == 6);
+
+        $display("life engine ok");
+        $finish();
+    }
+}

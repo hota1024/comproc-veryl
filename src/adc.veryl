@@ -1,0 +1,98 @@
+/// ComProc CPU ボードの自作 ADC を駆動する逐次比較 AD 変換器。
+///
+/// 外部回路はコンパレータ + PWM DAC + サンプル&ホールドで構成されている。
+/// 本家 comproc の src/cpu/adc.sv と同じ手順だが、
+/// 内蔵発振器 (125MHz) を使わず sys_clk (27MHz) だけで動かす。
+/// そのぶん PWM のキャリアは約 106kHz、1 回の変換は約 8.5ms になる。
+///
+/// 何もつながっていなくてもコンパレータ入力のノイズが乗るので、
+/// 変換結果は乱数の種としても使える。
+module Adc (
+    i_clk: input clock         ,
+    i_rst: input reset_sync_low,
+    /// コンパレータ出力。
+    i_cmp: input logic,
+    /// サンプル&ホールドスイッチ制御。
+    o_sh_ctl: output logic,
+    /// DAC 用の PWM 信号。
+    o_dac_pwm: output logic,
+    /// 変換結果。
+    o_result: output logic<8>,
+    /// 1 回の変換が終わるたびに 1 クロックだけ 1 になる。
+    o_done: output logic,
+) {
+    /// PWM の 1 周期。
+    const PWM_PERIOD: u32 = 255;
+    /// サンプリングに使う PWM 周期の数。
+    const TICK_SAMPLE_END: u32 = 100;
+    /// 1 ビット分の比較に使う PWM 周期の数。
+    const TICK_CONVERT_BIT: u32 = 100;
+
+    enum Phase: logic {
+        /// 入力をサンプリングしている。
+        Sample,
+        /// 逐次比較で 1 ビットずつ確定させている。
+        Convert,
+    }
+
+    var pwm   : logic<8>;
+    var tick  : logic<9>;
+    var sar   : logic<8>;
+    var phase : Phase   ;
+    var bitpos: logic<3>;
+    var result: logic<8>;
+    var done  : logic   ;
+
+    let pwm_next : logic<8> = if pwm >= (PWM_PERIOD - 1) as 8 ? 8'd0 : pwm + 1;
+    let tick_end : logic<9> = if phase == Phase::Sample ? TICK_SAMPLE_END as 9 : TICK_CONVERT_BIT as 9;
+    let tick_next: logic<9> = if tick >= tick_end - 1 ? 9'd0 : tick + 1;
+    /// PWM もチック数も一巡し切る瞬間。
+    let step_edge: logic = (pwm_next == 0) && (tick_next == 0);
+
+    assign o_sh_ctl  = phase != Phase::Sample;
+    assign o_dac_pwm = pwm <= sar - 1 && sar != 0;
+    assign o_result  = result;
+    assign o_done    = done;
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            pwm    = 0;
+            tick   = 0;
+            sar    = 8'h80;
+            phase  = Phase::Sample;
+            bitpos = 7;
+            result = 0;
+            done   = 0;
+        } else {
+            done = 0;
+            pwm  = pwm_next;
+
+            if pwm_next == 0 {
+                tick = tick_next;
+            }
+
+            if step_edge {
+                case phase {
+                    Phase::Sample: {
+                        // サンプリング終了。上位ビットから比較を始める。
+                        result = sar;
+                        done   = 1;
+                        sar    = 8'h80;
+                        bitpos = 7;
+                        phase  = Phase::Convert;
+                    }
+                    Phase::Convert: {
+                        // コンパレータの出力がそのままこのビットの答えになる。
+                        sar[bitpos] = i_cmp;
+                        if bitpos == 0 {
+                            phase = Phase::Sample;
+                        } else {
+                            sar[bitpos - 1] = 1;
+                            bitpos          = bitpos - 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
