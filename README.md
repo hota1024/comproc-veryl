@@ -26,7 +26,10 @@ board/rev4_tangnano9k/
   src/port.cst           ピン割り当て
   src/timing.sdc         27 MHz のクロック制約
   impl/project_process_config.json  合成オプション（トップは Main、SystemVerilog 2017）
+tool/
+  build-bitstream.sh     Gowin EDA を使わずに .fs を作るスクリプト
 target/               veryl build が生成する SystemVerilog（git 管理外）
+build/                オープンソースフローの中間生成物（git 管理外）
 ```
 
 ## ビルドと書き込み
@@ -39,19 +42,34 @@ veryl build
 
 `target/main.sv`、`target/lcd_hello.sv`、`target/lcd_writer.sv` が生成される。
 
-### 2. SystemVerilog → ビットストリーム
+### 2-a. Gowin EDA を使う
 
 `board/rev4_tangnano9k/rev4_tangnano9k.gprj` を Gowin EDA で開き、Synthesize → Place & Route を実行する。
-生成された `.fs` を Programmer で書き込む。
-
-`openFPGALoader` を使う場合:
+生成された `.fs` を Programmer か `openFPGALoader` で書き込む。
 
 ```sh
-# SRAM に書き込む（電源を切ると消える）
-openFPGALoader -b tangnano9k board/rev4_tangnano9k/impl/pnr/*.fs
-# フラッシュに書き込む
-openFPGALoader -b tangnano9k -f board/rev4_tangnano9k/impl/pnr/*.fs
+openFPGALoader -b tangnano9k board/rev4_tangnano9k/impl/pnr/*.fs      # SRAM
+openFPGALoader -b tangnano9k -f board/rev4_tangnano9k/impl/pnr/*.fs   # フラッシュ
 ```
+
+### 2-b. Gowin EDA を使わない（オープンソースフロー）
+
+macOS には Gowin EDA が無いので、こちらが実用的。
+[oss-cad-suite](https://github.com/YosysHQ/oss-cad-suite-build/releases)（yosys /
+nextpnr-himbaechel / gowin_pack / openFPGALoader が入っている）と `sv2v` を用意して、
+
+```sh
+./tool/build-bitstream.sh
+openFPGALoader -b tangnano9k build/hello.fs      # SRAM（電源断で消える）
+openFPGALoader -b tangnano9k -f build/hello.fs   # フラッシュ
+```
+
+中身は sv2v → yosys → nextpnr-himbaechel → gowin_pack の 4 段。
+`port.cst` は Gowin 形式のまま nextpnr に渡せる（SDC は使われないので `--freq 27` で代用）。
+Veryl が出す SystemVerilog は yosys が直接読めない（ユーザー定義型を返す function がある）ため
+sv2v を挟んでいる。
+
+macOS では oss-cad-suite を展開したあと `xattr -dr com.apple.quarantine <展開先>` が必要。
 
 ## テスト
 
@@ -77,6 +95,9 @@ veryl synth                 # 概算のゲート数・クリティカルパス
 
 生成された SystemVerilog は `verilator --lint-only -Wall` が警告なしで通る。
 
+オープンソースフロー（yosys + nextpnr-himbaechel）では 177 セル / 67 FF に収まり、
+`Max frequency for clock 'clk': 164 MHz (PASS at 27.00 MHz)` と報告される。
+
 ## 動作
 
 リセットボタンは 2 段のフリップフロップで同期化して同期リセットとして使う。
@@ -96,7 +117,7 @@ FPGA コンフィグ直後はフリップフロップが 0 から始まるため
 | 信号 | ピン | 備考 |
 | --- | --- | --- |
 | `sys_clk` | 52 | 27 MHz |
-| `rst_n_raw` | 4 | リセットボタン（負論理、LVCMOS18） |
+| `rst_n_raw` | 4 | リセットボタン（負論理） |
 | `lcd_e` | 76 | |
 | `lcd_rw` | 77 | 常に 0（書き込み専用） |
 | `lcd_rs` | 63 | |
@@ -108,6 +129,10 @@ FPGA コンフィグ直後はフリップフロップが 0 から始まるため
 
 本家 `port.cst` は `lcd_db[7:4]` という添字を使っているが、Veryl は `[3:0]` のビット範囲しか
 生成しないため、本プロジェクトでは `lcd_db[3]` を DB7 として添字を振り直している。
+
+また pin 4（リセットボタン）とオンボード LED は同じ I/O バンクにあるため、`IO_TYPE` を指定せず
+バンクの既定電圧に任せている。本家は pin 4 を LVCMOS18、LED を LVCMOS33 としているが、
+この組み合わせはバンク電圧が衝突するので `gowin_pack` が弾く（Gowin EDA は通す）。
 
 ## タイミング
 

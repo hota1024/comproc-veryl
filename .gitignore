@@ -10,3 +10,6 @@
 
 # Veryl incremental build cache
 /.build
+
+# オープンソースフローの中間生成物
+/build

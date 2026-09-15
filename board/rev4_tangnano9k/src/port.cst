@@ -7,8 +7,12 @@ IO_LOC "sys_clk" 52;
 IO_PORT "sys_clk" PULL_MODE=NONE IO_TYPE=LVCMOS33;
 
 // リセットボタン（押すと Low）
+// pin 4 とオンボード LED は同じ I/O バンクにあるため、IO_TYPE は指定せず
+// バンクの既定電圧に任せる（Sipeed 公式サンプルの cst と同じ扱い）。
+// 本家 comproc の cst は pin 4 を LVCMOS18、LED を LVCMOS33 としているが、
+// この組み合わせはバンク電圧が衝突するため apicula (gowin_pack) が弾く。
 IO_LOC "rst_n_raw" 4;
-IO_PORT "rst_n_raw" PULL_MODE=UP IO_TYPE=LVCMOS18;
+IO_PORT "rst_n_raw" PULL_MODE=UP;
 
 // キャラクタ LCD（HD44780 互換、4 ビットモード）
 IO_LOC "lcd_e"     76;
@@ -35,9 +39,9 @@ IO_LOC "onboard_led[2]" 13;
 IO_LOC "onboard_led[3]" 14;
 IO_LOC "onboard_led[4]" 15;
 IO_LOC "onboard_led[5]" 16;
-IO_PORT "onboard_led[0]" IO_TYPE=LVCMOS33;
-IO_PORT "onboard_led[1]" IO_TYPE=LVCMOS33;
-IO_PORT "onboard_led[2]" IO_TYPE=LVCMOS33;
-IO_PORT "onboard_led[3]" IO_TYPE=LVCMOS33;
-IO_PORT "onboard_led[4]" IO_TYPE=LVCMOS33;
-IO_PORT "onboard_led[5]" IO_TYPE=LVCMOS33;
+IO_PORT "onboard_led[0]" PULL_MODE=UP DRIVE=8;
+IO_PORT "onboard_led[1]" PULL_MODE=UP DRIVE=8;
+IO_PORT "onboard_led[2]" PULL_MODE=UP DRIVE=8;
+IO_PORT "onboard_led[3]" PULL_MODE=UP DRIVE=8;
+IO_PORT "onboard_led[4]" PULL_MODE=UP DRIVE=8;
+IO_PORT "onboard_led[5]" PULL_MODE=UP DRIVE=8;
