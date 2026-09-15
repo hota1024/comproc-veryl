@@ -119,45 +119,72 @@ src/
   lcd_hello.veryl       最初に作った "hello, world" 表示（単体デモとして残置）
   *_test.veryl          テストベンチ
 board/rev4_tangnano9k/  Gowin EDA プロジェクトとピン制約
-tool/build-bitstream.sh Gowin EDA を使わずに .fs を作るスクリプト
+Taskfile.yml            ビルド・書き込み・UART 操作のタスク定義
 ```
 
-## ビルドと書き込み
+## 使い方
 
-### Veryl → SystemVerilog
+[Task](https://taskfile.dev/) を入れておくと一通りの操作がまとまっている。
 
 ```sh
-veryl build
+brew install go-task
+task            # タスク一覧
+task doctor     # 必要なツールが揃っているか確認
 ```
 
-### Gowin EDA を使わない（オープンソースフロー）
+| タスク | 内容 |
+| --- | --- |
+| `task build` | Veryl から SystemVerilog を生成 |
+| `task check` / `task fmt` | 静的解析 / 整形 |
+| `task test` / `task test:verilator` | テストベンチ |
+| `task lint` | 生成 SystemVerilog を Verilator で lint |
+| `task ci` | 上をまとめて実行 |
+| `task bitstream` | `.fs` を作る（変わった段だけ走る） |
+| `task flash` / `task flash:rom` | SRAM / SPI フラッシュへ書き込み |
+| `task detect` | JTAG で FPGA を検出 |
+| `task monitor` | UART を眺める（終了は `Ctrl-A K`） |
+| `task status` | UART から状態を 1 行読む |
+| `task send -- r` | UART にコマンドを送る |
+| `task clean` | 生成物を消す |
 
-macOS には Gowin EDA が無いので、こちらが実用的。
-[oss-cad-suite](https://github.com/YosysHQ/oss-cad-suite-build/releases)（yosys /
-nextpnr-himbaechel / gowin_pack / openFPGALoader が入っている）と `sv2v` を用意して、
+UART のポートは自動で探すが、`PORT=/dev/cu.xxx task status` で指定もできる。
+oss-cad-suite を別の場所に置いている場合は `OSS_CAD_SUITE=...` で指定する。
+
+## ツールの用意
+
+`task doctor` で足りないものが分かる。
+
+| ツール | 入れ方 |
+| --- | --- |
+| Veryl | `cargo install verylup && verylup setup` |
+| Task | `brew install go-task` |
+| sv2v | `brew install sv2v` |
+| oss-cad-suite | [リリース](https://github.com/YosysHQ/oss-cad-suite-build/releases)から取得して `~/.local/share/oss-cad-suite` に展開 |
+
+oss-cad-suite には yosys / nextpnr-himbaechel / gowin_pack / openFPGALoader /
+verilator が入っている。macOS では展開したあとに
 
 ```sh
-./tool/build-bitstream.sh
-openFPGALoader -b tangnano9k build/hello.fs      # SRAM（電源断で消える）
-openFPGALoader -b tangnano9k -f build/hello.fs   # フラッシュ
+xattr -dr com.apple.quarantine ~/.local/share/oss-cad-suite
 ```
 
-中身は sv2v → yosys → nextpnr-himbaechel → gowin_pack の 4 段。
-`port.cst` は Gowin 形式のまま nextpnr に渡せる（SDC は使われないので `--freq 27` で代用）。
+が必要（バイナリに署名がないため）。別の場所に置く場合は `OSS_CAD_SUITE=...` で指定する。
 
-macOS では oss-cad-suite を展開したあと `xattr -dr com.apple.quarantine <展開先>` が必要。
+`veryl` が SystemVerilog を出し、`sv2v` が yosys の読めない構文（ユーザー定義型を返す
+function など）を落とし、`yosys` → `nextpnr-himbaechel` → `gowin_pack` で `.fs` になる。
+`port.cst` は Gowin 形式のまま nextpnr に渡せる（SDC は読まれないので `--freq 27` で代用）。
 
-### Gowin EDA を使う
+### Gowin EDA を使う場合
 
 `board/rev4_tangnano9k/rev4_tangnano9k.gprj` を開いて Synthesize → Place & Route。
+macOS 版の Gowin EDA は無いので Windows / Linux が必要。
 
 ## テスト
 
 ```sh
-veryl check                 # 静的解析
-veryl test                  # Veryl 内蔵シミュレータ
-veryl test --sim verilator  # Verilator
-veryl synth                 # 概算のゲート数・クリティカルパス
+task ci          # check + test + test:verilator + lint
+task test        # Veryl 内蔵シミュレータ
+task synth       # 概算のゲート数・クリティカルパス
 ```
 
 | テスト | 内容 |

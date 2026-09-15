@@ -1,0 +1,275 @@
+# https://taskfile.dev
+#
+# Veryl のビルドから実機への書き込み、UART での操作までをまとめたもの。
+# 必要なツールが揃っているかは `task doctor` で確認できる。
+#
+# Task は env: で PATH を上書きできないので、oss-cad-suite を使うタスクは
+# コマンドの先頭で明示的に PATH を通している。
+version: '3'
+
+vars:
+  BUILD: build
+  # Tang Nano 9K に載っている FPGA
+  DEVICE: GW1NR-LV9QN88PC6/I5
+  FAMILY: GW1N-9C
+  BOARD: tangnano9k
+  CST: board/rev4_tangnano9k/src/port.cst
+  # nextpnr はタイミング制約に SDC を読まないので周波数[MHz]で渡す
+  FREQ: 27
+  FS: '{{.BUILD}}/comproc-veryl.fs'
+  BAUD: 115200
+  TOP: Main
+  # oss-cad-suite の展開先。環境変数 OSS_CAD_SUITE で上書きできる。
+  OSS_CAD_SUITE:
+    sh: echo "${OSS_CAD_SUITE:-$HOME/.local/share/oss-cad-suite}"
+  OSS_BIN: '{{.OSS_CAD_SUITE}}/bin'
+  # UART のポート。環境変数 PORT で上書きできる。
+  # ComProc ボードの FT230X はシリアル番号付き (/dev/cu.usbserial-DK0G0ZTN) で
+  # 見えるので、番号だけの名前 (/dev/cu.usbserial-1100) より優先する。
+  PORT:
+    sh: |
+      if [ -n "${PORT:-}" ]; then
+        echo "$PORT"
+      else
+        ls /dev/cu.usbserial-* 2>/dev/null | grep -vE 'usbserial-[0-9]+$' | head -n 1 \
+          || ls /dev/cu.usbserial-* 2>/dev/null | head -n 1 \
+          || true
+      fi
+
+tasks:
+  default:
+    desc: タスク一覧を出す
+    silent: true
+    cmds:
+      - task --list
+
+  # ================ Veryl ================
+  fmt:
+    desc: Veryl のソースを整形する
+    cmds:
+      - veryl fmt
+
+  check:
+    desc: Veryl の静的解析
+    cmds:
+      - veryl check
+
+  build:
+    desc: Veryl から SystemVerilog を生成する
+    sources:
+      - src/**/*.veryl
+      - Veryl.toml
+    generates:
+      - comproc.f
+    cmds:
+      - veryl build
+
+  test:
+    desc: テストベンチを Veryl 内蔵シミュレータで実行する
+    cmds:
+      - veryl test {{.CLI_ARGS}}
+
+  test:verilator:
+    desc: テストベンチを Verilator で実行する
+    cmds:
+      - veryl test --sim verilator {{.CLI_ARGS}}
+
+  lint:
+    desc: 生成された SystemVerilog を Verilator で lint する
+    deps: [build]
+    cmds:
+      - |
+        export PATH="{{.OSS_BIN}}:$PATH"
+        verilator --lint-only -Wall -Wno-DECLFILENAME -Wno-PINCONNECTEMPTY \
+          --top-module {{.TOP}} $(cat comproc.f)
+
+  synth:
+    desc: 概算のゲート数とクリティカルパスを見る
+    cmds:
+      - veryl synth
+
+  ci:
+    desc: 静的解析・テスト・lint をまとめて実行する
+    cmds:
+      - task: check
+      - task: test
+      - task: test:verilator
+      - task: lint
+
+  # ================ ビットストリーム ================
+  # sv2v → yosys → nextpnr-himbaechel → gowin_pack の 4 段。
+  # それぞれ入力が変わったときだけ動く。
+  sv2v:
+    internal: true
+    deps: [build]
+    sources:
+      - target/*.sv
+    generates:
+      - '{{.BUILD}}/top.v'
+    cmds:
+      - mkdir -p {{.BUILD}}
+      # Veryl が出す SystemVerilog には yosys が読めない構文
+      # （ユーザー定義型を返す function など）が含まれるので通しておく。
+      - |
+        export PATH="{{.OSS_BIN}}:$PATH"
+        sv2v $(cat comproc.f) > {{.BUILD}}/top.v
+
+  yosys:
+    internal: true
+    deps: [sv2v]
+    sources:
+      - '{{.BUILD}}/top.v'
+    generates:
+      - '{{.BUILD}}/top.json'
+    cmds:
+      - |
+        export PATH="{{.OSS_BIN}}:$PATH"
+        yosys -p "read_verilog {{.BUILD}}/top.v; synth_gowin -top {{.TOP}} -json {{.BUILD}}/top.json"
+
+  pnr:
+    internal: true
+    deps: [yosys]
+    sources:
+      - '{{.BUILD}}/top.json'
+      - '{{.CST}}'
+    generates:
+      - '{{.BUILD}}/pnr.json'
+    cmds:
+      # port.cst は Gowin 形式のまま nextpnr に渡せる。
+      - |
+        export PATH="{{.OSS_BIN}}:$PATH"
+        nextpnr-himbaechel --json {{.BUILD}}/top.json --write {{.BUILD}}/pnr.json \
+          --device "{{.DEVICE}}" --vopt family={{.FAMILY}} --vopt cst={{.CST}} --freq {{.FREQ}}
+
+  bitstream:
+    desc: ビットストリーム (.fs) を作る
+    deps: [pnr]
+    sources:
+      - '{{.BUILD}}/pnr.json'
+    generates:
+      - '{{.FS}}'
+    cmds:
+      - |
+        export PATH="{{.OSS_BIN}}:$PATH"
+        gowin_pack -d {{.FAMILY}} -o {{.FS}} {{.BUILD}}/pnr.json
+      - echo "built {{.FS}}"
+
+  # ================ 実機 ================
+  detect:
+    desc: JTAG で FPGA を検出する
+    cmds:
+      - |
+        export PATH="{{.OSS_BIN}}:$PATH"
+        openFPGALoader --detect -b {{.BOARD}}
+
+  flash:
+    desc: SRAM に書き込む（電源を切ると消える）
+    deps: [bitstream]
+    cmds:
+      - |
+        export PATH="{{.OSS_BIN}}:$PATH"
+        openFPGALoader -b {{.BOARD}} {{.FS}}
+
+  flash:rom:
+    desc: SPI フラッシュに書き込む（電源を切っても残る）
+    deps: [bitstream]
+    prompt: SPI フラッシュを上書きします。よろしいですか？
+    cmds:
+      - |
+        export PATH="{{.OSS_BIN}}:$PATH"
+        openFPGALoader -b {{.BOARD}} -f {{.FS}}
+
+  # ================ UART ================
+  # ComProc CPU ボードの USB シリアル (FT230X) をつないでおくこと。
+  monitor:
+    desc: UART の状態表示を眺める（終了は Ctrl-A K）
+    interactive: true
+    preconditions:
+      - sh: test -n "{{.PORT}}"
+        msg: シリアルポートが見つかりません。PORT=/dev/cu.xxx で指定してください。
+    cmds:
+      - screen {{.PORT}} {{.BAUD}}
+
+  status:
+    desc: UART から状態を 1 行読む
+    silent: true
+    preconditions:
+      - sh: test -n "{{.PORT}}"
+        msg: シリアルポートが見つかりません。PORT=/dev/cu.xxx で指定してください。
+      - sh: '! lsof {{.PORT}} >/dev/null 2>&1'
+        msg: 'ポートが他のプロセスに使われています（task monitor の screen を終了してください）'
+    cmds:
+      # macOS では device を閉じると通信設定が既定値に戻るので、
+      # fd 3 で開いたまま stty・送信・受信をまとめて行う。
+      - |
+        exec 3<> {{.PORT}}
+        case "$(uname)" in
+          Darwin) stty -f {{.PORT}} {{.BAUD}} raw -echo ;;
+          *)      stty -F {{.PORT}} {{.BAUD}} raw -echo ;;
+        esac
+        printf 'p' >&3
+        head -n 2 <&3 | tail -n 1
+        exec 3>&-
+
+  send:
+    desc: 'UART にコマンドを送る（例: task send -- r）'
+    silent: true
+    preconditions:
+      - sh: test -n "{{.PORT}}"
+        msg: シリアルポートが見つかりません。PORT=/dev/cu.xxx で指定してください。
+      - sh: test -n "{{.CLI_ARGS}}"
+        msg: '送る文字を指定してください（例: task send -- r）'
+      - sh: '! lsof {{.PORT}} >/dev/null 2>&1'
+        msg: 'ポートが他のプロセスに使われています（task monitor の screen を終了してください）'
+    cmds:
+      - |
+        exec 3<> {{.PORT}}
+        case "$(uname)" in
+          Darwin) stty -f {{.PORT}} {{.BAUD}} raw -echo ;;
+          *)      stty -F {{.PORT}} {{.BAUD}} raw -echo ;;
+        esac
+        printf '%s' '{{.CLI_ARGS}}' >&3
+        exec 3>&-
+
+  # ================ その他 ================
+  doctor:
+    desc: 必要なツールが揃っているか確かめる
+    silent: true
+    cmds:
+      - |
+        export PATH="{{.OSS_BIN}}:$PATH"
+        status=0
+        check() {
+          if command -v "$1" >/dev/null 2>&1; then
+            printf '  \033[32mok\033[0m   %-22s %s\n' "$1" "$(command -v "$1")"
+          else
+            printf '  \033[31mNG\033[0m   %-22s %s\n' "$1" "$2"
+            status=1
+          fi
+        }
+        echo "Veryl:"
+        check veryl              "cargo install verylup && verylup setup"
+        echo "オープンソースフロー:"
+        check sv2v               "brew install sv2v"
+        check yosys              "oss-cad-suite に含まれる"
+        check nextpnr-himbaechel "oss-cad-suite に含まれる"
+        check gowin_pack         "oss-cad-suite に含まれる"
+        check openFPGALoader     "oss-cad-suite に含まれる"
+        check verilator          "oss-cad-suite に含まれる（brew install verilator でも可）"
+        echo
+        echo "oss-cad-suite: {{.OSS_CAD_SUITE}}"
+        echo "  https://github.com/YosysHQ/oss-cad-suite-build/releases から取得して展開し、"
+        echo "  macOS では xattr -dr com.apple.quarantine {{.OSS_CAD_SUITE}} を実行する。"
+        echo "  別の場所に置いている場合は OSS_CAD_SUITE=... で指定する。"
+        echo
+        if [ -n "{{.PORT}}" ]; then
+          printf 'UART: \033[32m%s\033[0m\n' "{{.PORT}}"
+        else
+          printf 'UART: \033[33m見つかりません\033[0m（ComProc ボードの USB をつなぐ）\n'
+        fi
+        exit $status
+
+  clean:
+    desc: 生成物を消す
+    cmds:
+      - rm -rf {{.BUILD}} target dependencies .build comproc.f
