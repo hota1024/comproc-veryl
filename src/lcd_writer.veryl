@@ -1,0 +1,128 @@
+/// HD44780 互換キャラクタ LCD を 4 ビットモードで駆動する書き込みエンジン。
+///
+/// ComProc CPU ボードの LCD は RW を Low 固定（書き込み専用）で使うため、
+/// ビジーフラグは読まずに、1 回の転送ごとに固定時間待つ。
+/// タイミングは comproc/src/examples/lcd.c の動作実績に合わせてある。
+///
+/// 1 回の転送は次の 4 状態で構成される。
+///
+/// ```text
+///          Idle      Setup        Pulse         Wait
+///   RS/DB  ----<==========================================>----
+///   E      _________________/~~~~~~~~~~~\___________________
+///                           ^ ここで LCD がデータを取り込む（立ち下がり）
+/// ```
+module LcdWriter #(
+    /// i_clk の周波数[Hz]。Tang Nano 9K の発振器は 27 MHz。
+    param CLK_FREQ_HZ: u32 = 27_000_000,
+) (
+    i_clk: input clock         ,
+    i_rst: input reset_sync_low,
+    /// 書き込み要求。o_ready と同時に 1 のとき受け付けられる。
+    i_valid: input logic,
+    /// 1 のとき新しい書き込み要求を受け付けられる。
+    o_ready: output logic,
+    /// 0: コマンド (RS=0) / 1: 表示データ (RS=1)
+    i_rs: input logic,
+    /// 送るバイト。
+    i_data: input logic<8>,
+    /// 1: 上位 4 ビットだけを送る（8 ビットモードから移行する初期化で使う）。
+    i_nibble: input logic,
+    /// 1: 転送後の待ち時間を長くする（初期化コマンドと Clear Display で使う）。
+    i_long  : input  logic,
+    o_lcd_e : output logic,
+    o_lcd_rs: output logic,
+    /// LCD の DB7..DB4。o_lcd_db[3] が DB7。
+    o_lcd_db: output logic<4>,
+) {
+    const CYC_PER_US: u32 = CLK_FREQ_HZ / 1_000_000;
+
+    /// RS/DB を確定させてから E を上げるまでの時間。tAS(60ns) に対して十分長い。
+    const T_SETUP: u32 = CYC_PER_US * 1;
+    /// E を High に保つ時間。PWEH(450ns) に対して十分長い。
+    const T_PULSE: u32 = CYC_PER_US * 2;
+    /// 通常のコマンド/データ転送後の待ち時間。
+    /// 仕様上は 37us で足りるが、lcd.c と同じ 2ms にして安全側に倒している。
+    const T_WAIT_SHORT: u32 = CYC_PER_US * 2_000;
+    /// 初期化コマンドと Clear Display 後の待ち時間。
+    /// Function set の 4.1ms、Clear Display の 1.52ms をどちらも満たす。
+    const T_WAIT_LONG: u32 = CYC_PER_US * 5_000;
+
+    const CNT_W: u32 = $clog2(T_WAIT_LONG + 1);
+
+    enum State: logic<2> {
+        /// 要求待ち。
+        Idle,
+        /// RS/DB を出して E を上げるまでの待ち。
+        Setup,
+        /// E = 1。
+        Pulse,
+        /// E を下げてから次の転送までの待ち。
+        Wait,
+    }
+
+    var state : State       ;
+    var cnt   : logic<CNT_W>;
+    var rs_r  : logic       ;
+    var data_r: logic<8>    ;
+    var nib_r : logic       ;
+    var long_r: logic       ;
+    /// 1 のとき下位ニブルを転送中。
+    var low_r: logic;
+
+    let wait_cyc: logic<CNT_W> = if long_r ? T_WAIT_LONG as CNT_W : T_WAIT_SHORT as CNT_W;
+
+    assign o_ready  = state == State::Idle;
+    assign o_lcd_e  = state == State::Pulse;
+    assign o_lcd_rs = rs_r;
+    assign o_lcd_db = if low_r ? data_r[3:0] : data_r[7:4];
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            state  = State::Idle;
+            cnt    = 0;
+            rs_r   = 0;
+            data_r = 0;
+            nib_r  = 0;
+            long_r = 0;
+            low_r  = 0;
+        } else {
+            case state {
+                State::Idle : if i_valid {
+                    rs_r   = i_rs;
+                    data_r = i_data;
+                    nib_r  = i_nibble;
+                    long_r = i_long;
+                    low_r  = 0;
+                    cnt    = 0;
+                    state  = State::Setup;
+                }
+                State::Setup: if cnt >= T_SETUP as CNT_W {
+                    cnt   = 0;
+                    state = State::Pulse;
+                } else {
+                    cnt = cnt + 1;
+                }
+                State::Pulse: if cnt >= T_PULSE as CNT_W {
+                    cnt   = 0;
+                    state = State::Wait;
+                } else {
+                    cnt = cnt + 1;
+                }
+                State::Wait : if cnt >= wait_cyc {
+                    cnt = 0;
+                    if low_r || nib_r {
+                        // 1 バイト分（または初期化の 4 ビット）を送り終えた。
+                        state = State::Idle;
+                    } else {
+                        // 続けて下位ニブルを送る。
+                        low_r = 1;
+                        state = State::Setup;
+                    }
+                } else {
+                    cnt = cnt + 1;
+                }
+            }
+        }
+    }
+}

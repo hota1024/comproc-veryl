@@ -1,0 +1,12 @@
+[project]
+name = "comproc"
+version = "0.1.0"
+
+[build]
+sources = ["src"]
+target = {type = "directory", path = "target"}
+# 生成される SystemVerilog のモジュール名からプロジェクト名の接頭辞を外す。
+# （Gowin EDA 側でトップモジュールを Main として扱いやすくするため）
+omit_project_prefix = true
+# std ライブラリは使っていないので出力しない。
+exclude_std = true

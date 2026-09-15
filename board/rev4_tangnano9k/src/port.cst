@@ -1,0 +1,43 @@
+// ComProc CPU ボード Rev4 (Tang Nano 9K) のピン割り当て。
+// comproc/src/cpu/board/rev4_tangnano9k/src/port.cst から
+// 本プロジェクトで使うピンだけを抜き出したもの。
+
+// 27 MHz 発振器
+IO_LOC "sys_clk" 52;
+IO_PORT "sys_clk" PULL_MODE=NONE IO_TYPE=LVCMOS33;
+
+// リセットボタン（押すと Low）
+IO_LOC "rst_n_raw" 4;
+IO_PORT "rst_n_raw" PULL_MODE=UP IO_TYPE=LVCMOS18;
+
+// キャラクタ LCD（HD44780 互換、4 ビットモード）
+IO_LOC "lcd_e"     76;
+IO_LOC "lcd_rw"    77;
+IO_LOC "lcd_rs"    63;
+// 本家 port.cst の lcd_db[7:4] に対応する。
+// Veryl は [3:0] のビット範囲しか生成しないので添字を振り直してある。
+IO_LOC "lcd_db[3]" 32; // DB7
+IO_LOC "lcd_db[2]" 31; // DB6
+IO_LOC "lcd_db[1]" 49; // DB5
+IO_LOC "lcd_db[0]" 48; // DB4
+IO_PORT "lcd_e"     IO_TYPE=LVCMOS33;
+IO_PORT "lcd_rw"    IO_TYPE=LVCMOS33;
+IO_PORT "lcd_rs"    IO_TYPE=LVCMOS33;
+IO_PORT "lcd_db[3]" IO_TYPE=LVCMOS33;
+IO_PORT "lcd_db[2]" IO_TYPE=LVCMOS33;
+IO_PORT "lcd_db[1]" IO_TYPE=LVCMOS33;
+IO_PORT "lcd_db[0]" IO_TYPE=LVCMOS33;
+
+// Tang Nano 9K のオンボード LED（負論理）。動作確認用。
+IO_LOC "onboard_led[0]" 10;
+IO_LOC "onboard_led[1]" 11;
+IO_LOC "onboard_led[2]" 13;
+IO_LOC "onboard_led[3]" 14;
+IO_LOC "onboard_led[4]" 15;
+IO_LOC "onboard_led[5]" 16;
+IO_PORT "onboard_led[0]" IO_TYPE=LVCMOS33;
+IO_PORT "onboard_led[1]" IO_TYPE=LVCMOS33;
+IO_PORT "onboard_led[2]" IO_TYPE=LVCMOS33;
+IO_PORT "onboard_led[3]" IO_TYPE=LVCMOS33;
+IO_PORT "onboard_led[4]" IO_TYPE=LVCMOS33;
+IO_PORT "onboard_led[5]" IO_TYPE=LVCMOS33;

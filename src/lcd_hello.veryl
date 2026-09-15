@@ -1,0 +1,165 @@
+/// LCD に "hello, world" を表示するシーケンサ。
+///
+/// リセット解除後に一度だけ、初期化コマンド列と文字列を LcdWriter へ流し込む。
+/// 送出が終わったら Done 状態で停止する。
+///
+/// 送るコマンド列は comproc/src/examples/lcd.c と同じ考え方で、
+/// 8 ビットモードから 4 ビットモードへ移行してから文字を書く。
+module LcdHello #(
+    /// i_clk の周波数[Hz]。
+    param CLK_FREQ_HZ: u32 = 27_000_000,
+) (
+    i_clk  : input  clock         ,
+    i_rst  : input  reset_sync_low,
+    o_lcd_e: output logic         ,
+    /// このモジュールは書き込みしかしないので常に 0。
+    o_lcd_rw: output logic,
+    o_lcd_rs: output logic,
+    /// LCD の DB7..DB4。o_lcd_db[3] が DB7。
+    o_lcd_db: output logic<4>,
+    /// 表示が終わったら 1 になる。
+    o_done: output logic,
+) {
+    /// LCD へ送る 1 操作。
+    struct LcdOp {
+        /// 1: 転送後に長めに待つ。
+        long_wait: logic,
+        /// 1: 上位 4 ビットのみ送る。
+        nibble: logic,
+        /// 0: コマンド / 1: 表示データ。
+        rs  : logic   ,
+        data: logic<8>,
+    }
+
+    /// コマンド（RS=0、8 ビット転送、通常待ち）。
+    function cmd (
+        data: input logic<8>,
+    ) -> LcdOp {
+        return LcdOp'{long_wait: 0, nibble: 0, rs: 0, data: data};
+    }
+
+    /// 実行に時間がかかるコマンド（Clear Display など）。
+    function cmd_long (
+        data: input logic<8>,
+    ) -> LcdOp {
+        return LcdOp'{long_wait: 1, nibble: 0, rs: 0, data: data};
+    }
+
+    /// 4 ビットモードへ移行する前の、上位 4 ビットだけのコマンド。
+    function cmd_nibble (
+        data: input logic<8>,
+    ) -> LcdOp {
+        return LcdOp'{long_wait: 1, nibble: 1, rs: 0, data: data};
+    }
+
+    /// 表示データ（RS=1）。
+    function chr (
+        data: input logic<8>,
+    ) -> LcdOp {
+        return LcdOp'{long_wait: 0, nibble: 0, rs: 1, data: data};
+    }
+
+    /// 送る操作の個数。
+    const OP_NUM: u32 = 21;
+    const IDX_W : u32 = $clog2(OP_NUM);
+
+    /// 電源投入から LCD の内部リセットが終わるまでの待ち時間。
+    /// データシートの規定は 40ms 以上だが、余裕を見て 100ms 待つ。
+    const POWER_ON_WAIT: u32 = CLK_FREQ_HZ / 10;
+    const POW_W        : u32 = $clog2(POWER_ON_WAIT + 1);
+
+    enum Phase: logic<2> {
+        /// 電源投入直後の待ち。
+        PowerOn,
+        /// 1 操作を LcdWriter へ渡す。
+        Send,
+        /// LcdWriter の転送完了待ち。
+        Busy,
+        /// 全操作の送出完了。
+        Done,
+    }
+
+    var phase  : Phase       ;
+    var op_idx : logic<IDX_W>;
+    var pow_cnt: logic<POW_W>;
+
+    var wr_ready: logic;
+    let wr_valid: logic = phase == Phase::Send;
+
+    let op: LcdOp = case op_idx {
+        // 8 ビットモードのまま Function set を 3 回送り、LCD の状態を既知にする。
+        0      : cmd_nibble(8'h30),
+        1      : cmd_nibble(8'h30),
+        2      : cmd_nibble(8'h30),
+        // 4 ビットモードへ切り替える。
+        3      : cmd_nibble(8'h20),
+        // ここから 8 ビットのコマンド/データを上位・下位ニブルに分けて送れる。
+        4      : cmd(8'h28), // Function set: 4 ビット / 2 行 / 5x8 ドット
+        5      : cmd(8'h0c), // Display on, カーソル off, ブリンク off
+        6      : cmd(8'h06), // Entry mode: 書き込むたびにアドレスを +1
+        7      : cmd_long(8'h01), // Clear display（1.52ms かかる）
+        8      : cmd(8'h80), // DDRAM アドレスを 1 行目の先頭 (0x00) へ
+        // "hello, world"
+        9      : chr(8'h68), // 'h'
+        10     : chr(8'h65), // 'e'
+        11     : chr(8'h6c), // 'l'
+        12     : chr(8'h6c), // 'l'
+        13     : chr(8'h6f), // 'o'
+        14     : chr(8'h2c), // ','
+        15     : chr(8'h20), // ' '
+        16     : chr(8'h77), // 'w'
+        17     : chr(8'h6f), // 'o'
+        18     : chr(8'h72), // 'r'
+        19     : chr(8'h6c), // 'l'
+        20     : chr(8'h64), // 'd'
+        default: cmd(8'h00),
+    };
+
+    assign o_lcd_rw = 0;
+    assign o_done   = phase == Phase::Done;
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            phase   = Phase::PowerOn;
+            op_idx  = 0;
+            pow_cnt = 0;
+        } else {
+            case phase {
+                Phase::PowerOn: if pow_cnt >= POWER_ON_WAIT as POW_W {
+                    phase = Phase::Send;
+                } else {
+                    pow_cnt = pow_cnt + 1;
+                }
+                Phase::Send   : if wr_ready {
+                    // このクロックエッジで LcdWriter が要求を受け付ける。
+                    phase = Phase::Busy;
+                }
+                Phase::Busy   : if wr_ready {
+                    if op_idx == (OP_NUM - 1) as IDX_W {
+                        phase = Phase::Done;
+                    } else {
+                        op_idx = op_idx + 1;
+                        phase  = Phase::Send;
+                    }
+                }
+                Phase::Done   : {}
+            }
+        }
+    }
+
+    inst writer: LcdWriter #(
+        CLK_FREQ_HZ: CLK_FREQ_HZ,
+    ) (
+        i_clk                 ,
+        i_rst                 ,
+        i_valid : wr_valid    ,
+        o_ready : wr_ready    ,
+        i_rs    : op.rs       ,
+        i_data  : op.data     ,
+        i_nibble: op.nibble   ,
+        i_long  : op.long_wait,
+        o_lcd_e               ,
+        o_lcd_rs              ,
+        o_lcd_db              ,
+    );
+}

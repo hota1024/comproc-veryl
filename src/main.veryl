@@ -1,0 +1,49 @@
+/// ComProc CPU ボード Rev4 (Tang Nano 9K) 用トップモジュール。
+///
+/// ポート名は comproc リポジトリの
+/// src/cpu/board/rev4_tangnano9k/src/port.cst に合わせてある。
+/// ただし lcd_db だけは Veryl が [3:0] のビット範囲しか生成しないため、
+/// 本プロジェクトの port.cst では lcd_db[3] を DB7 として割り当てている。
+module Main (
+    /// 27 MHz 発振器 (pin 52)。
+    sys_clk: input logic,
+    /// リセットボタン (pin 4)。押すと Low。
+    rst_n_raw: input  logic,
+    lcd_e    : output logic,
+    lcd_rw   : output logic,
+    lcd_rs   : output logic,
+    /// lcd_db[3]=DB7, [2]=DB6, [1]=DB5, [0]=DB4。
+    lcd_db: output logic<4>,
+    /// Tang Nano 9K のオンボード LED (負論理)。動作確認用。
+    onboard_led: output logic<6>,
+) {
+    const CLK_FREQ_HZ: u32 = 27_000_000;
+
+    let clk: '_ clock = sys_clk;
+
+    // リセットボタンを 2 段のフリップフロップで同期化して同期リセットとして使う。
+    // FPGA コンフィグ直後は rst_n_ff が 0 から始まるため、
+    // ボタンを押さなくても電源投入時にリセットがかかる。
+    var rst_n_ff: logic<2>;
+    always_ff (clk) {
+        rst_n_ff = {rst_n_ff[0], rst_n_raw};
+    }
+    let rst_n: '_ reset_sync_low = rst_n_ff[1];
+
+    var done: logic;
+
+    // 表示が終わったらオンボード LED を 1 個点灯する（負論理）。
+    assign onboard_led = if done ? 6'b111110 : 6'b111111;
+
+    inst hello: LcdHello #(
+        CLK_FREQ_HZ: CLK_FREQ_HZ,
+    ) (
+        i_clk   : clk   ,
+        i_rst   : rst_n ,
+        o_lcd_e : lcd_e ,
+        o_lcd_rw: lcd_rw,
+        o_lcd_rs: lcd_rs,
+        o_lcd_db: lcd_db,
+        o_done  : done  ,
+    );
+}

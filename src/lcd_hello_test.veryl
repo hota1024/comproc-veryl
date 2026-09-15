@@ -1,0 +1,151 @@
+/// LcdHello が LCD の端子に出す波形を検証するテストベンチ。
+///
+/// `veryl test` で実行する。合成対象の SystemVerilog には出力されない。
+///
+/// シミュレーション時間を短くするため、クロックを 1 MHz として扱う。
+/// 待ち時間はすべて CLK_FREQ_HZ から計算されるので、
+/// 27 MHz のときと同じサイクル数比で動く。
+#[test(test_lcd_hello)]
+module test_lcd_hello {
+    const CLK_FREQ_HZ: u32 = 1_000_000;
+
+    /// 電源投入待ちに必要な最低サイクル数（40ms 相当）。
+    const MIN_POWER_ON_CYCLE: u32 = 40_000;
+    /// E の High 幅として最低限必要なサイクル数（1 MHz なら 2us 相当）。
+    const MIN_E_HIGH_CYCLE: u32 = 2;
+    /// 転送と転送の間に最低限必要なサイクル数（2ms 相当）。
+    const MIN_GAP_CYCLE: u32 = 2_000;
+    /// 1 回のエッジ待ちで諦めるまでのサイクル数。
+    const MAX_WAIT: u32 = 200_000;
+
+    /// E の立ち下がりで LCD が取り込むはずの値を並べたもの。
+    /// 上位 1 ビットが RS、下位 4 ビットが DB7..DB4。
+    const EXP_NUM: u32                = 38;
+    const EXP    : logic<5> [EXP_NUM] = '{
+    // 8 ビットモードでの Function set x3（上位ニブルのみ）
+        5'h03, 5'h03, 5'h03,
+        // 4 ビットモードへ切り替え（上位ニブルのみ）
+        5'h02,
+        // ここからは 1 バイトを上位・下位ニブルの順に送る
+        5'h02, 5'h08, // 0x28 Function set
+        5'h00, 5'h0c, // 0x0c Display on
+        5'h00, 5'h06, // 0x06 Entry mode
+        5'h00, 5'h01, // 0x01 Clear display
+        5'h08, 5'h00, // 0x80 DDRAM アドレス 0x00
+        // "hello, world"（RS=1）
+        5'h16, 5'h18, // 'h' 0x68
+        5'h16, 5'h15, // 'e' 0x65
+        5'h16, 5'h1c, // 'l' 0x6c
+        5'h16, 5'h1c, // 'l' 0x6c
+        5'h16, 5'h1f, // 'o' 0x6f
+        5'h12, 5'h1c, // ',' 0x2c
+        5'h12, 5'h10, // ' ' 0x20
+        5'h17, 5'h17, // 'w' 0x77
+        5'h16, 5'h1f, // 'o' 0x6f
+        5'h17, 5'h12, // 'r' 0x72
+        5'h16, 5'h1c, // 'l' 0x6c
+        5'h16,
+        5'h14 // 'd' 0x64
+    };
+
+    inst u_clock: $tb::clock_gen;
+
+    var rst_n_r:    logic         ;
+    let rst_n  : '_ reset_sync_low = rst_n_r;
+
+    var lcd_e : logic   ;
+    var lcd_rw: logic   ;
+    var lcd_rs: logic   ;
+    var lcd_db: logic<4>;
+    var done  : logic   ;
+
+    /// E が Low だった期間（前の転送の取り込みから次の E 立ち上がりまで）。
+    var e_low_cyc: u32;
+    /// E が High だった期間。
+    var e_high_cyc: u32;
+
+    /// リセット解除からのサイクル数。
+    var cyc: u32;
+    always_ff (u_clock, rst_n) {
+        if_reset {
+            cyc = 0;
+        } else {
+            cyc = cyc + 1;
+        }
+    }
+
+    inst dut: LcdHello #(
+        CLK_FREQ_HZ: CLK_FREQ_HZ,
+    ) (
+        i_clk   : u_clock,
+        i_rst   : rst_n  ,
+        o_lcd_e : lcd_e  ,
+        o_lcd_rw: lcd_rw ,
+        o_lcd_rs: lcd_rs ,
+        o_lcd_db: lcd_db ,
+        o_done  : done   ,
+    );
+
+    initial {
+        rst_n_r = 0;
+        u_clock.next(4);
+        rst_n_r = 1;
+
+        for n in 0..EXP_NUM {
+            // E の立ち上がりを待つ。
+            e_low_cyc = 0;
+            for _t in 0..MAX_WAIT {
+                if lcd_e == 1 {
+                    break;
+                }
+                e_low_cyc = e_low_cyc + 1;
+                u_clock.next(1);
+            }
+            $assert(lcd_e == 1);
+
+            if n != 0 {
+                // 前の取り込みから 2ms 以上空けていること。
+                // LCD の実行時間（最長 1.52ms）をビジーフラグを読まずに吸収する。
+                $assert(e_low_cyc >= MIN_GAP_CYCLE);
+            }
+
+            if n == 0 {
+                // 電源投入後、LCD の内部リセットを十分に待ってから
+                // 最初の転送を始めていること。
+                $display("first transfer starts at cycle %d", cyc);
+                $assert(cyc >= MIN_POWER_ON_CYCLE);
+            }
+
+            // E の立ち下がりを待つ。ここで LCD がデータを取り込む。
+            e_high_cyc = 0;
+            for _t in 0..MAX_WAIT {
+                if lcd_e == 0 {
+                    break;
+                }
+                e_high_cyc = e_high_cyc + 1;
+                u_clock.next(1);
+            }
+            $assert(lcd_e == 0);
+
+            // E の High 幅が PWEH(450ns) を満たしていること。
+            $assert(e_high_cyc >= MIN_E_HIGH_CYCLE);
+
+            // 書き込み専用なので RW は常に 0。
+            $assert(lcd_rw == 0);
+            $assert({lcd_rs, lcd_db} == EXP[n]);
+        }
+
+        // これ以上の転送が無いこと、および完了フラグが立つことを確認する。
+        for _t in 0..MAX_WAIT {
+            if done == 1 {
+                break;
+            }
+            $assert(lcd_e == 0);
+            u_clock.next(1);
+        }
+        $assert(done == 1);
+
+        $display("all %d nibbles matched", EXP_NUM);
+        $finish();
+    }
+}

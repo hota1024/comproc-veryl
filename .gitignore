@@ -1,0 +1,12 @@
+# Veryl build output
+/target
+/dependencies
+*.f
+
+# Gowin EDA build output
+/board/*/impl/gwsynthesis/
+/board/*/impl/pnr/
+/board/*/impl/temp/
+
+# Veryl incremental build cache
+/.build
