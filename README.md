@@ -6,6 +6,9 @@
 CPU は使わず、LCD コントローラ（HD44780 互換）を直接叩く純ハードウェアとして実装している。
 コマンド列の考え方は本家の [`src/examples/lcd.c`](https://github.com/uchan-nos/comproc/blob/main/src/examples/lcd.c) と同じ。
 
+ComProc CPU ボード Rev4 (Tang Nano 9K) の実機で表示を確認済み
+（sv2v + yosys + nextpnr-himbaechel + gowin_pack のオープンソースフロー）。
+
 ```
 +----------------+     +-----------+     +-----------+
 |    LcdHello    | --> | LcdWriter | --> |    LCD    |
